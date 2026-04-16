@@ -51,10 +51,10 @@ In Laravel Cloud, go to **Your Org → Settings → API Tokens** and create a to
 Migrate a single application interactively.
 
 ```bash
-./cloud-migrator migrate
-./cloud-migrator migrate --app=myapp --source-token=xxx --target-token=yyy
-./cloud-migrator migrate --app=myapp --source-token=xxx --target-token=yyy --dry-run
-./cloud-migrator migrate --app=myapp --source-token=xxx --target-token=yyy --yes --migrate-db --move-domains --deploy
+cloud-migrator migrate
+cloud-migrator migrate --app=myapp --source-token=xxx --target-token=yyy
+cloud-migrator migrate --app=myapp --source-token=xxx --target-token=yyy --dry-run
+cloud-migrator migrate --app=myapp --source-token=xxx --target-token=yyy --yes --migrate-db --move-domains --deploy
 ```
 
 **Options:**
@@ -83,9 +83,9 @@ Migrate a single application interactively.
 Migrate all applications in a source organization at once. Shared database clusters and caches are deduplicated — if multiple apps use the same cluster, only one is created in the target and all apps are linked to it.
 
 ```bash
-./cloud-migrator migrate-all --source-token=xxx --target-token=yyy
-./cloud-migrator migrate-all --source-token=xxx --target-token=yyy --dry-run
-./cloud-migrator migrate-all --source-token=xxx --target-token=yyy --yes --migrate-db --move-domains --deploy
+cloud-migrator migrate-all --source-token=xxx --target-token=yyy
+cloud-migrator migrate-all --source-token=xxx --target-token=yyy --dry-run
+cloud-migrator migrate-all --source-token=xxx --target-token=yyy --yes --migrate-db --move-domains --deploy
 ```
 
 Accepts the same flags as `migrate`. Apps already present in the target are skipped for migration but `--move-domains` still runs for them.
@@ -97,9 +97,9 @@ Accepts the same flags as `migrate`. Apps already present in the target are skip
 Migrate database data for apps that were already migrated structurally. Useful when you ran `migrate-all` without `--migrate-db` and want to transfer data separately, or need to re-run data migration for specific schemas.
 
 ```bash
-./cloud-migrator migrate-db --source-token=xxx --target-token=yyy
-./cloud-migrator migrate-db --source-token=xxx --target-token=yyy --skip-data=logs
-./cloud-migrator migrate-db --source-token=xxx --target-token=yyy --ignore-table=app.reports
+cloud-migrator migrate-db --source-token=xxx --target-token=yyy
+cloud-migrator migrate-db --source-token=xxx --target-token=yyy --skip-data=logs
+cloud-migrator migrate-db --source-token=xxx --target-token=yyy --ignore-table=app.reports
 ```
 
 Uses a parallel per-table dump engine (up to 4 concurrent workers) to avoid query timeouts on large databases. Data routes through your local machine.
@@ -117,9 +117,9 @@ Uses a parallel per-table dump engine (up to 4 concurrent workers) to avoid quer
 Verify migrated database contents with exact `COUNT(*)` per table. Flags missing tables, row count mismatches, and tables only present on one side. Transient tables (`jobs`, `cache`, `cache_locks`, `sessions`, `job_batches`) are marked as expected and not flagged as errors.
 
 ```bash
-./cloud-migrator verify-db --source-token=xxx --target-token=yyy
-./cloud-migrator verify-db --source-token=xxx --target-token=yyy --schema=myapp
-./cloud-migrator verify-db --source-token=xxx --target-token=yyy --skip-schema=logs
+cloud-migrator verify-db --source-token=xxx --target-token=yyy
+cloud-migrator verify-db --source-token=xxx --target-token=yyy --schema=myapp
+cloud-migrator verify-db --source-token=xxx --target-token=yyy --skip-schema=logs
 ```
 
 ---
@@ -129,9 +129,9 @@ Verify migrated database contents with exact `COUNT(*)` per table. Flags missing
 Check HTTP health of all environments in an organization, following redirects and reporting response time.
 
 ```bash
-./cloud-migrator health --target-token=yyy
-./cloud-migrator health --target-token=yyy --timeout=30
-./cloud-migrator health --target-token=yyy --expect-2xx   # exits non-zero if any env is not 2xx (CI use)
+cloud-migrator health --target-token=yyy
+cloud-migrator health --target-token=yyy --timeout=30
+cloud-migrator health --target-token=yyy --expect-2xx   # exits non-zero if any env is not 2xx (CI use)
 ```
 
 | Icon | Meaning |
@@ -149,7 +149,7 @@ Check HTTP health of all environments in an organization, following redirects an
 Compare source and target organizations side by side to verify migration progress.
 
 ```bash
-./cloud-migrator status --source-token=xxx --target-token=yyy
+cloud-migrator status --source-token=xxx --target-token=yyy
 ```
 
 ---
@@ -159,13 +159,13 @@ Compare source and target organizations side by side to verify migration progres
 Transfer a Laravel Cloud vanity domain (e.g. `myapp.laravel.cloud`) from the source app to the matching target app by renaming the app slug.
 
 ```bash
-./cloud-migrator transfer-vanity --app=myapp --source-token=xxx --target-token=yyy
+cloud-migrator transfer-vanity --app=myapp --source-token=xxx --target-token=yyy
 ```
 
 If the source app is being decommissioned anyway, use `--delete-source` to delete it first, which releases the slug immediately. There will be a brief window (~5s) while the slug transfers to the target.
 
 ```bash
-./cloud-migrator transfer-vanity --app=myapp --source-token=xxx --target-token=yyy --delete-source --yes
+cloud-migrator transfer-vanity --app=myapp --source-token=xxx --target-token=yyy --delete-source --yes
 ```
 
 > **Note:** Laravel Cloud holds slugs for an extended period after a rename or deletion. If claiming the slug fails, the command retries automatically for up to 5 minutes. If it still fails, re-run the command later — the "already renamed" state is detected and the rename step is skipped.
@@ -177,8 +177,8 @@ If the source app is being decommissioned anyway, use `--delete-source` to delet
 Delete source org applications after verifying they exist in the target. Only apps confirmed present in the target by name are deleted — unmatched apps are never touched.
 
 ```bash
-./cloud-migrator decommission --source-token=xxx --target-token=yyy
-./cloud-migrator decommission --source-token=xxx --target-token=yyy --delete-clusters --delete-caches --yes
+cloud-migrator decommission --source-token=xxx --target-token=yyy
+cloud-migrator decommission --source-token=xxx --target-token=yyy --delete-clusters --delete-caches --yes
 ```
 
 | Flag | Description |
@@ -194,7 +194,7 @@ Delete source org applications after verifying they exist in the target. Only ap
 List all applications in a Laravel Cloud organization.
 
 ```bash
-./cloud-migrator list-apps --token=xxx
+cloud-migrator list-apps --token=xxx
 ```
 
 ---
@@ -203,28 +203,28 @@ List all applications in a Laravel Cloud organization.
 
 ```bash
 # 1. Preview what will be migrated (no changes made)
-./cloud-migrator migrate-all --source-token=xxx --target-token=yyy --dry-run
+cloud-migrator migrate-all --source-token=xxx --target-token=yyy --dry-run
 
 # 2. Migrate structure
-./cloud-migrator migrate-all --source-token=xxx --target-token=yyy --yes
+cloud-migrator migrate-all --source-token=xxx --target-token=yyy --yes
 
 # 3. Transfer database data
-./cloud-migrator migrate-db --source-token=xxx --target-token=yyy --yes
+cloud-migrator migrate-db --source-token=xxx --target-token=yyy --yes
 
 # 4. Verify row counts match
-./cloud-migrator verify-db --source-token=xxx --target-token=yyy
+cloud-migrator verify-db --source-token=xxx --target-token=yyy
 
 # 5. Move custom domains (zero-downtime — same IP as source)
-./cloud-migrator migrate-all --source-token=xxx --target-token=yyy --move-domains --yes
+cloud-migrator migrate-all --source-token=xxx --target-token=yyy --move-domains --yes
 
 # 6. Health check the target
-./cloud-migrator health --target-token=yyy
+cloud-migrator health --target-token=yyy
 
 # 7. Decommission the source
-./cloud-migrator decommission --source-token=xxx --target-token=yyy --yes
+cloud-migrator decommission --source-token=xxx --target-token=yyy --yes
 
 # 8. Transfer Laravel Cloud vanity domains (optional)
-./cloud-migrator transfer-vanity --app=myapp --source-token=xxx --target-token=yyy
+cloud-migrator transfer-vanity --app=myapp --source-token=xxx --target-token=yyy
 ```
 
 ---
