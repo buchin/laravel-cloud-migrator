@@ -825,64 +825,7 @@ class MigrationService
                 throw new \RuntimeException('pg_dump/psql not found — install PostgreSQL client tools and retry.');
             }
 
-            $srcDsn = sprintf('postgresql://%s:%s@%s:%d/%s',
-                rawurlencode($srcConn['username']),
-                rawurlencode($srcConn['password']),
-                $srcConn['hostname'],
-                (int) $srcConn['port'],
-                $srcDb,
-            );
-            $tgtDsn = sprintf('postgresql://%s:%s@%s:%d/%s',
-                rawurlencode($tgtConn['username']),
-                rawurlencode($tgtConn['password']),
-                $tgtConn['hostname'],
-                (int) $tgtConn['port'],
-                $tgtDb,
-            );
-            $dumpCmd = escapeshellarg($dumpBin).' '.escapeshellarg($srcDsn);
-            $importCmd = escapeshellarg($importBin).' '.escapeshellarg($tgtDsn);
-
-            $progress("Dumping {$srcDb} → {$tgtDb}...");
-
-            $mysqlProc = proc_open($importCmd, [
-                0 => ['pipe', 'r'],
-                1 => ['pipe', 'w'],
-                2 => ['pipe', 'w'],
-            ], $mysqlPipes);
-
-            if (! is_resource($mysqlProc)) {
-                throw new \RuntimeException('Failed to start psql import process.');
-            }
-
-            $dumpProc = proc_open($dumpCmd, [
-                0 => ['pipe', 'r'],
-                1 => $mysqlPipes[0],
-                2 => ['pipe', 'w'],
-            ], $dumpPipes);
-
-            if (! is_resource($dumpProc)) {
-                proc_close($mysqlProc);
-                throw new \RuntimeException('Failed to start pg_dump process.');
-            }
-
-            fclose($dumpPipes[0]);
-            $dumpStderr = stream_get_contents($dumpPipes[2]);
-            fclose($dumpPipes[2]);
-            $dumpExit = proc_close($dumpProc);
-
-            $mysqlStderr = stream_get_contents($mysqlPipes[2]);
-            fclose($mysqlPipes[1]);
-            fclose($mysqlPipes[2]);
-            $mysqlExit = proc_close($mysqlProc);
-
-            if ($dumpExit !== 0) {
-                throw new \RuntimeException("pg_dump failed (exit {$dumpExit}): ".trim($dumpStderr));
-            }
-            if ($mysqlExit !== 0) {
-                throw new \RuntimeException("psql import failed (exit {$mysqlExit}): ".trim($mysqlStderr));
-            }
-
-            $progress("Data migrated: {$srcDb}");
+            $this->runPostgresMigration($dumpBin, $importBin, $srcConn, $srcDb, $tgtConn, $tgtDb, $progress, $ignoreTables, $concurrency);
         } else {
             $dumpBin = $this->findBinary('mysqldump');
             $importBin = $this->findBinary('mysql');
@@ -892,6 +835,255 @@ class MigrationService
 
             $this->runMysqlMigration($dumpBin, $importBin, $srcConn, $srcDb, $tgtConn, $tgtDb, $progress, $ignoreTables, $concurrency);
         }
+    }
+
+    /**
+     * Parallel per-table PostgreSQL migration.
+     *
+     * Phase 1: schema-only dump (pg_dump --schema-only) → import.
+     * Phase 2: per-table data dumps (pg_dump -t {table} --data-only) in parallel.
+     */
+    private function runPostgresMigration(
+        string $dumpBin,
+        string $importBin,
+        array $srcConn,
+        string $srcDb,
+        array $tgtConn,
+        string $tgtDb,
+        callable $progress,
+        array $ignoreTables = [],
+        int $concurrency = 4,
+    ): void {
+        $srcDsn = sprintf('postgresql://%s:%s@%s:%d/%s',
+            rawurlencode($srcConn['username']),
+            rawurlencode($srcConn['password']),
+            $srcConn['hostname'],
+            (int) $srcConn['port'],
+            $srcDb,
+        );
+        $tgtDsn = sprintf('postgresql://%s:%s@%s:%d/%s',
+            rawurlencode($tgtConn['username']),
+            rawurlencode($tgtConn['password']),
+            $tgtConn['hostname'],
+            (int) $tgtConn['port'],
+            $tgtDb,
+        );
+
+        $tmpDir = sys_get_temp_dir().'/cloud_migrator_pg_'.uniqid();
+        mkdir($tmpDir, 0700, true);
+
+        try {
+            // ── Phase 1: schema-only dump ────────────────────────────────────
+            $progress("Dumping schema for {$srcDb}...");
+
+            $schemaFile = $tmpDir.'/schema.sql';
+            $schemaErrFile = $tmpDir.'/schema.err';
+
+            $schemaDumpCmd = escapeshellarg($dumpBin)
+                .' --schema-only'
+                .' --no-owner'
+                .' --no-acl'
+                .' '.escapeshellarg($srcDsn);
+
+            $proc = proc_open($schemaDumpCmd, [
+                0 => ['file', '/dev/null', 'r'],
+                1 => ['file', $schemaFile, 'w'],
+                2 => ['file', $schemaErrFile, 'w'],
+            ], $pipes);
+
+            if (! is_resource($proc)) {
+                throw new \RuntimeException('Failed to start pg_dump for schema.');
+            }
+            $exitCode = $this->waitProc($proc);
+            if ($exitCode !== 0) {
+                throw new \RuntimeException('Schema dump failed: '.trim(file_get_contents($schemaErrFile) ?: ''));
+            }
+
+            $schemaImportErrFile = $tmpDir.'/schema.import.err';
+            $proc = proc_open(escapeshellarg($importBin).' '.escapeshellarg($tgtDsn), [
+                0 => ['file', $schemaFile, 'r'],
+                1 => ['file', '/dev/null', 'w'],
+                2 => ['file', $schemaImportErrFile, 'w'],
+            ], $pipes);
+
+            if (! is_resource($proc)) {
+                throw new \RuntimeException('Failed to start psql for schema import.');
+            }
+            $exitCode = $this->waitProc($proc);
+            if ($exitCode !== 0) {
+                throw new \RuntimeException('Schema import failed: '.trim(file_get_contents($schemaImportErrFile) ?: ''));
+            }
+            @unlink($schemaFile);
+
+            // ── Phase 2: parallel per-table data dumps ───────────────────────
+            $tables = $this->getPostgresTables($importBin, $srcDsn, $ignoreTables);
+            $total = count($tables);
+
+            if ($ignoreTables) {
+                $progress('  Excluding tables: '.implode(', ', $ignoreTables));
+            }
+
+            $progress("  Migrating {$total} table(s) with concurrency={$concurrency}...");
+
+            $pending = array_values($tables);
+            $running = [];
+            $completed = 0;
+            $failedTables = [];
+
+            while (! empty($pending) || ! empty($running)) {
+                while (count($running) < $concurrency && ! empty($pending)) {
+                    $table = array_shift($pending);
+                    $safe = preg_replace('/[^a-zA-Z0-9_]/', '_', $table);
+                    $sqlFile = $tmpDir.'/'.$safe.'.sql';
+                    $dumpErrFile = $tmpDir.'/'.$safe.'.dump.err';
+
+                    $tableDumpCmd = escapeshellarg($dumpBin)
+                        .' --data-only'
+                        .' --no-owner'
+                        .' --no-acl'
+                        .' --disable-triggers'
+                        .' -t '.escapeshellarg($table)
+                        .' '.escapeshellarg($srcDsn);
+
+                    $proc = proc_open($tableDumpCmd, [
+                        0 => ['file', '/dev/null', 'r'],
+                        1 => ['file', $sqlFile, 'w'],
+                        2 => ['file', $dumpErrFile, 'w'],
+                    ], $pipes);
+
+                    if (is_resource($proc)) {
+                        $running[$table] = [
+                            'phase' => 'dumping',
+                            'proc' => $proc,
+                            'sqlFile' => $sqlFile,
+                            'dumpErrFile' => $dumpErrFile,
+                            'importErrFile' => null,
+                        ];
+                    } else {
+                        $progress("  ✗ Could not start dump for {$table}");
+                        $failedTables[] = $table;
+                    }
+                }
+
+                foreach (array_keys($running) as $table) {
+                    $worker = $running[$table];
+                    $status = proc_get_status($worker['proc']);
+
+                    if ($status['running']) {
+                        continue;
+                    }
+
+                    $exitCode = proc_close($worker['proc']);
+                    if ($exitCode === -1) {
+                        $exitCode = $status['exitcode'] ?? -1;
+                    }
+
+                    if ($worker['phase'] === 'dumping') {
+                        if ($exitCode !== 0) {
+                            $err = trim(file_get_contents($worker['dumpErrFile']) ?: '');
+                            $progress("  ✗ Dump failed: {$table}".($err ? " — {$err}" : ''));
+                            $failedTables[] = $table;
+                            unset($running[$table]);
+                        } else {
+                            $importErrFile = $tmpDir.'/'.preg_replace('/[^a-zA-Z0-9_]/', '_', $table).'.import.err';
+                            $importProc = proc_open(escapeshellarg($importBin).' '.escapeshellarg($tgtDsn), [
+                                0 => ['file', $worker['sqlFile'], 'r'],
+                                1 => ['file', '/dev/null', 'w'],
+                                2 => ['file', $importErrFile, 'w'],
+                            ], $pipes);
+
+                            if (is_resource($importProc)) {
+                                $running[$table] = [
+                                    'phase' => 'importing',
+                                    'proc' => $importProc,
+                                    'sqlFile' => $worker['sqlFile'],
+                                    'dumpErrFile' => $worker['dumpErrFile'],
+                                    'importErrFile' => $importErrFile,
+                                ];
+                            } else {
+                                $progress("  ✗ Could not start import for {$table}");
+                                $failedTables[] = $table;
+                                unset($running[$table]);
+                            }
+                        }
+                    } elseif ($worker['phase'] === 'importing') {
+                        if ($exitCode !== 0) {
+                            $err = trim(file_get_contents($worker['importErrFile']) ?: '');
+                            $progress("  ✗ Import failed: {$table}".($err ? " — {$err}" : ''));
+                            $failedTables[] = $table;
+                        } else {
+                            $completed++;
+                            $rows = $this->getPostgresRowCount($importBin, $tgtDsn, $table);
+                            $progress("  Migrated {$table} ({$rows} rows)");
+                        }
+
+                        unset($running[$table]);
+                        @unlink($worker['sqlFile']);
+                    }
+                }
+
+                if (! empty($running)) {
+                    usleep(200000);
+                }
+            }
+
+            if (! empty($failedTables)) {
+                $count = count($failedTables);
+                $progress("  ⚠ {$count} table(s) failed: ".implode(', ', $failedTables));
+            }
+
+            $progress("Data migrated: {$srcDb}");
+
+        } finally {
+            foreach (glob($tmpDir.'/*') ?: [] as $file) {
+                @unlink($file);
+            }
+            @rmdir($tmpDir);
+        }
+    }
+
+    /** Return user tables in a Postgres database, excluding $ignoreTables, largest first. */
+    private function getPostgresTables(string $psql, string $dsn, array $ignoreTables = []): array
+    {
+        $excludeClause = '';
+        if ($ignoreTables) {
+            $quoted = implode(',', array_map(fn ($t) => "'".addslashes($t)."'", $ignoreTables));
+            $excludeClause = " AND tablename NOT IN ({$quoted})";
+        }
+
+        $sql = "SELECT tablename FROM pg_tables WHERE schemaname='public'{$excludeClause} ORDER BY tablename";
+
+        $cmd = escapeshellarg($psql)
+            .' --no-psqlrc'
+            .' --tuples-only'
+            .' --no-align'
+            .' -c '.escapeshellarg($sql)
+            .' '.escapeshellarg($dsn)
+            .' 2>/dev/null';
+
+        exec($cmd, $output, $exitCode);
+
+        if ($exitCode !== 0) {
+            return [];
+        }
+
+        return array_values(array_filter(array_map('trim', $output)));
+    }
+
+    /** Return row count for a single Postgres table. */
+    private function getPostgresRowCount(string $psql, string $dsn, string $table): int
+    {
+        $cmd = escapeshellarg($psql)
+            .' --no-psqlrc'
+            .' --tuples-only'
+            .' --no-align'
+            .' -c '.escapeshellarg("SELECT COUNT(*) FROM \"{$table}\"")
+            .' '.escapeshellarg($dsn)
+            .' 2>/dev/null';
+
+        exec($cmd, $output);
+
+        return (int) trim($output[0] ?? '0');
     }
 
     /**

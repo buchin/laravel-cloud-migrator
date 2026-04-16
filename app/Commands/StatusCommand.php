@@ -102,11 +102,16 @@ class StatusCommand extends Command
                 ? " <fg=gray>(slug: {$tgtSlug})</>"
                 : '';
 
-            $this->line("<fg=green>✓</> <fg=yellow;options=bold>{$appName}</>{$slugNote}");
-
             // Fetch environments from both sides
             $srcEnvs = $source->getAll("applications/{$srcApp['id']}/environments", ['include' => 'database,cache']);
             $tgtEnvs = $target->getAll("applications/{$tgtApp['id']}/environments", ['include' => 'database,cache']);
+
+            // Environment count at app level
+            $envCountNote = count($srcEnvs) === count($tgtEnvs)
+                ? '<fg=green>✓ '.count($tgtEnvs).' env(s)</>'
+                : '<fg=yellow>⚠ '.count($tgtEnvs).'/'.count($srcEnvs).' env(s)</>';
+
+            $this->line("<fg=green>✓</> <fg=yellow;options=bold>{$appName}</>{$slugNote}  {$envCountNote}");
 
             $tgtEnvByName = [];
             foreach ($tgtEnvs as $e) {
@@ -129,13 +134,25 @@ class StatusCommand extends Command
                 // Env vars
                 $srcVars = $srcEnv['attributes']['environment_variables'] ?? [];
                 $tgtVars = $tgtEnv['attributes']['environment_variables'] ?? [];
-                $srcCount = count($srcVars);
-                $tgtCount = count($tgtVars);
+                $srcVarCount = count($srcVars);
+                $tgtVarCount = count($tgtVars);
 
-                if ($srcCount === $tgtCount) {
-                    $this->line("    <fg=green>✓</> Env vars: {$tgtCount}/{$srcCount}");
+                if ($srcVarCount === $tgtVarCount) {
+                    $this->line("    <fg=green>✓</> Env vars: {$tgtVarCount}/{$srcVarCount}");
                 } else {
-                    $this->line("    <fg=yellow>⚠</> Env vars: {$tgtCount}/{$srcCount} — <fg=yellow>mismatch</>");
+                    $this->line("    <fg=yellow>⚠</> Env vars: {$tgtVarCount}/{$srcVarCount} — <fg=yellow>mismatch</>");
+                    $allGood = false;
+                }
+
+                // Domains
+                $srcDomains = $this->fetchDomainCount($source, $srcEnv['id']);
+                $tgtDomains = $this->fetchDomainCount($target, $tgtEnv['id']);
+                if ($srcDomains === 0 && $tgtDomains === 0) {
+                    // No domains on either side — skip
+                } elseif ($srcDomains === $tgtDomains) {
+                    $this->line("    <fg=green>✓</> Domains: {$tgtDomains}/{$srcDomains}");
+                } else {
+                    $this->line("    <fg=yellow>⚠</> Domains: {$tgtDomains}/{$srcDomains} — <fg=yellow>not all moved</>");
                     $allGood = false;
                 }
 
@@ -327,6 +344,17 @@ class StatusCommand extends Command
         }
 
         return (int) trim($output[0]);
+    }
+
+    private function fetchDomainCount(CloudApiClient $client, string $envId): int
+    {
+        try {
+            $domains = $client->getAll("environments/{$envId}/domains");
+
+            return count($domains);
+        } catch (RuntimeException) {
+            return 0;
+        }
     }
 
     private function findBinary(string $name): ?string
