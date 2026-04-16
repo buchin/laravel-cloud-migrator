@@ -18,7 +18,7 @@ use function Laravel\Prompts\text;
 
 class TransferVanityCommand extends Command
 {
-    protected $signature = 'transfer-vanity
+    protected $signature = 'vanity:transfer
                             {--source-token= : API token for the source organization}
                             {--target-token= : API token for the target organization}
                             {--app= : App name (e.g. "termapi")}

@@ -12,7 +12,7 @@ use function Laravel\Prompts\spin;
 
 class ListCommand extends Command
 {
-    protected $signature = 'list-apps
+    protected $signature = 'app:list
                             {--token= : API token for the organization}';
 
     protected $description = 'List all applications in a Laravel Cloud organization';

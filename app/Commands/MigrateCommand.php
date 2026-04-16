@@ -18,7 +18,7 @@ use function Laravel\Prompts\spin;
 
 class MigrateCommand extends Command
 {
-    protected $signature = 'migrate
+    protected $signature = 'app:migrate
                             {--source-token= : API token for the source organization}
                             {--target-token= : API token for the target organization}
                             {--app= : Slug or name of the application to migrate}

@@ -17,7 +17,7 @@ use function Laravel\Prompts\spin;
 
 class MigrateAllCommand extends Command
 {
-    protected $signature = 'migrate-all
+    protected $signature = 'app:migrate-all
                             {--source-token= : API token for the source organization}
                             {--target-token= : API token for the target organization}
                             {--dry-run : Show migration plans without making any changes}

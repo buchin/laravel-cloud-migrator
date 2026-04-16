@@ -12,7 +12,7 @@ use function Laravel\Prompts\spin;
 
 class HealthCommand extends Command
 {
-    protected $signature = 'health
+    protected $signature = 'org:health
                             {--target-token= : API token for the target organization}
                             {--timeout=10 : HTTP request timeout in seconds}
                             {--expect-2xx : Exit with failure if any environment returns a non-2xx response}';

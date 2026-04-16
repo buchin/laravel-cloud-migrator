@@ -14,7 +14,7 @@ use function Laravel\Prompts\spin;
 
 class DecommissionCommand extends Command
 {
-    protected $signature = 'decommission
+    protected $signature = 'org:decommission
                             {--source-token= : API token for the source organization (to be cleaned up)}
                             {--target-token= : API token for the target organization (to verify migration)}
                             {--delete-clusters : Also delete source database clusters after apps are removed}

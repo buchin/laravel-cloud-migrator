@@ -12,7 +12,7 @@ use function Laravel\Prompts\spin;
 
 class VerifyDbCommand extends Command
 {
-    protected $signature = 'verify-db
+    protected $signature = 'db:verify
                             {--source-token= : API token for the source organization}
                             {--target-token= : API token for the target organization}
                             {--schema=* : Only verify specific schemas (default: all)}

@@ -12,7 +12,7 @@ use function Laravel\Prompts\spin;
 
 class StatusCommand extends Command
 {
-    protected $signature = 'status
+    protected $signature = 'org:status
                             {--source-token= : API token for the source organization}
                             {--target-token= : API token for the target organization}';
 

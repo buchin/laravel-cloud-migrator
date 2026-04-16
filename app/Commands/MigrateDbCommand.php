@@ -15,7 +15,7 @@ use function Laravel\Prompts\spin;
 
 class MigrateDbCommand extends Command
 {
-    protected $signature = 'migrate-db
+    protected $signature = 'db:migrate
                             {--source-token= : API token for the source organization}
                             {--target-token= : API token for the target organization}
                             {--skip-data=* : Skip data migration for specific schemas (e.g. --skip-data=nerd)}
