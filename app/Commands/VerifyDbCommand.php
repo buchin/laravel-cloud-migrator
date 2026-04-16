@@ -16,7 +16,8 @@ class VerifyDbCommand extends Command
                             {--source-token= : API token for the source organization}
                             {--target-token= : API token for the target organization}
                             {--schema=* : Only verify specific schemas (default: all)}
-                            {--skip-schema=* : Skip these schemas}';
+                            {--skip-schema=* : Skip these schemas}
+                            {--only-mismatches : Only show tables with problems (hide green/gray rows)}';
 
     protected $description = 'Verify migrated database contents with exact COUNT(*) per table';
 
@@ -91,6 +92,7 @@ class VerifyDbCommand extends Command
         }
 
         $allGood = true;
+        $onlyMismatches = (bool) $this->option('only-mismatches');
 
         foreach ($schemasToCheck as $schema) {
             $this->newLine();
@@ -113,7 +115,9 @@ class VerifyDbCommand extends Command
 
                 if (! $inSrc) {
                     $tgtCount = number_format((int) $this->count($mysql, $tgtConn, $schema, $table));
-                    $this->row('yellow', '⚠', $table, '—', $tgtCount, 'only in target');
+                    if (! $onlyMismatches) {
+                        $this->row('yellow', '⚠', $table, '—', $tgtCount, 'only in target');
+                    }
 
                     continue;
                 }
@@ -131,7 +135,9 @@ class VerifyDbCommand extends Command
 
                 if ($this->isTransient($table)) {
                     // Transient tables (queues, caches, sessions) are expected to diverge.
-                    $this->row('gray', '·', $table, number_format($src), number_format($tgt), 'transient (ok)');
+                    if (! $onlyMismatches) {
+                        $this->row('gray', '·', $table, number_format($src), number_format($tgt), 'transient (ok)');
+                    }
 
                     continue;
                 }
@@ -142,7 +148,9 @@ class VerifyDbCommand extends Command
                     $allGood = $schemaGood = false;
                 }
 
-                $this->row($color, $icon, $table, number_format($src), number_format($tgt), $label);
+                if (! $onlyMismatches || $color !== 'green') {
+                    $this->row($color, $icon, $table, number_format($src), number_format($tgt), $label);
+                }
             }
 
             $this->newLine();

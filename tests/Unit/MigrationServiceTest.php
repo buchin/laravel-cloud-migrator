@@ -5,7 +5,6 @@ use App\Data\EnvironmentData;
 use App\Data\MigrationPlan;
 use App\Services\CloudApiClient;
 use App\Services\MigrationService;
-use Mockery\MockInterface;
 
 function makeApp(string $id = 'app-1', string $name = 'myapp', string $slug = 'myapp'): array
 {

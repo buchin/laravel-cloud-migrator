@@ -9,6 +9,7 @@ use RuntimeException;
 use function Laravel\Prompts\confirm;
 use function Laravel\Prompts\error;
 use function Laravel\Prompts\info;
+use function Laravel\Prompts\note;
 use function Laravel\Prompts\password;
 use function Laravel\Prompts\spin;
 
@@ -19,6 +20,7 @@ class DecommissionCommand extends Command
                             {--target-token= : API token for the target organization (to verify migration)}
                             {--delete-clusters : Also delete source database clusters after apps are removed}
                             {--delete-caches : Also delete source cache clusters after apps are removed}
+                            {--dry-run : Show the decommission plan without making any changes}
                             {--yes : Skip confirmation prompts}';
 
     protected $description = 'Delete source org apps (and optionally clusters/caches) after verifying migration to target';
@@ -118,6 +120,13 @@ class DecommissionCommand extends Command
         if (empty($safeToDelete) && ! $this->option('delete-clusters') && ! $this->option('delete-caches')) {
             $this->newLine();
             info('Nothing to decommission.');
+
+            return self::SUCCESS;
+        }
+
+        if ($this->option('dry-run')) {
+            $this->newLine();
+            note('Dry run complete — no changes were made.');
 
             return self::SUCCESS;
         }

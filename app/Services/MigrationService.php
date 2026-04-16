@@ -814,7 +814,7 @@ class MigrationService
         return null;
     }
 
-    public function runDatabaseMigration(array $srcConn, string $srcDb, array $tgtConn, string $tgtDb, string $dbType, callable $progress, array $ignoreTables = []): void
+    public function runDatabaseMigration(array $srcConn, string $srcDb, array $tgtConn, string $tgtDb, string $dbType, callable $progress, array $ignoreTables = [], int $concurrency = 4): void
     {
         $isPostgres = str_contains($dbType, 'pgsql') || str_contains($dbType, 'postgres');
 
@@ -890,7 +890,7 @@ class MigrationService
                 throw new \RuntimeException('mysqldump/mysql not found — install MySQL client tools and retry.');
             }
 
-            $this->runMysqlMigration($dumpBin, $importBin, $srcConn, $srcDb, $tgtConn, $tgtDb, $progress, $ignoreTables);
+            $this->runMysqlMigration($dumpBin, $importBin, $srcConn, $srcDb, $tgtConn, $tgtDb, $progress, $ignoreTables, $concurrency);
         }
     }
 

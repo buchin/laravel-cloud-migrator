@@ -2,10 +2,8 @@
 
 use App\Services\CloudApiClient;
 use GuzzleHttp\Client;
-use GuzzleHttp\Exception\ClientException;
 use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\HandlerStack;
-use GuzzleHttp\Psr7\Request;
 use GuzzleHttp\Psr7\Response;
 
 function makeClient(array $responses): CloudApiClient

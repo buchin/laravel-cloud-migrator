@@ -20,6 +20,8 @@ class MigrateDbCommand extends Command
                             {--target-token= : API token for the target organization}
                             {--skip-data=* : Skip data migration for specific schemas (e.g. --skip-data=nerd)}
                             {--ignore-table=* : Exclude specific tables, format: schema.table (e.g. --ignore-table=dojo.nerd_daily_report_urls)}
+                            {--concurrency=4 : Parallel table dump workers for MySQL (default: 4)}
+                            {--verbose : Show per-table progress lines (default: schema-level summary only)}
                             {--yes : Skip confirmation prompt and proceed automatically}';
 
     protected $description = 'Migrate database data between organizations (for apps already migrated)';
@@ -127,6 +129,8 @@ class MigrateDbCommand extends Command
 
         $service = new MigrationService($source, $target);
         $anyFailed = false;
+        $verbose = (bool) $this->option('verbose');
+        $concurrency = max(1, (int) ($this->option('concurrency') ?? 4));
 
         foreach ($pairs as $pair) {
             $schemaName = $pair['schema'];
@@ -135,8 +139,8 @@ class MigrateDbCommand extends Command
             $this->newLine();
             $this->line("<fg=cyan;options=bold>── {$schemaName} ──</>");
 
-            // Wait for target cluster to be available (poll connection endpoint).
             $tgtConn = $pair['tgt_conn'];
+            $tableCount = 0;
 
             try {
                 $service->runDatabaseMigration(
@@ -145,11 +149,25 @@ class MigrateDbCommand extends Command
                     tgtConn: $tgtConn,
                     tgtDb: $schemaName,
                     dbType: $pair['db_type'],
-                    progress: function (string $message) {
-                        $this->line("  <fg=green>✓</> {$message}");
+                    progress: function (string $message) use ($verbose, &$tableCount) {
+                        // Per-table lines look like "  Migrated tablename (N rows)"
+                        $isTableLine = str_starts_with(ltrim($message), 'Migrated ') && str_contains($message, ' rows)');
+                        if ($isTableLine) {
+                            $tableCount++;
+                            if ($verbose) {
+                                $this->line("  <fg=green>✓</> {$message}");
+                            }
+                        } else {
+                            $this->line("  <fg=green>✓</> {$message}");
+                        }
                     },
                     ignoreTables: $schemaIgnoreTables,
+                    concurrency: $concurrency,
                 );
+
+                if (! $verbose && $tableCount > 0) {
+                    $this->line("  <fg=green>✓</> {$tableCount} table(s) migrated.");
+                }
             } catch (RuntimeException $e) {
                 $this->newLine();
                 $this->line("  <fg=red>✗</> Failed: {$e->getMessage()}");
