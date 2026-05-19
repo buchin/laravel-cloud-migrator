@@ -62,7 +62,7 @@ class DecommissionCommand extends Command
             return self::FAILURE;
         }
 
-        if (empty($sourceApps)) {
+        if (empty($sourceApps) && ! $this->option('delete-clusters') && ! $this->option('delete-caches')) {
             info('No applications in source organization — nothing to decommission.');
 
             return self::SUCCESS;

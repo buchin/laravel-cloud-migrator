@@ -1110,9 +1110,9 @@ class MigrationService
         $tmpDir = sys_get_temp_dir().'/cloud_migrator_'.uniqid();
         mkdir($tmpDir, 0700, true);
 
-        // Options file to disable server-side query timeout for mysqldump.
+        // Empty options file — still passed via --defaults-extra-file so the flag is accepted.
         $optFile = $tmpDir.'/my.cnf';
-        file_put_contents($optFile, "[mysqldump]\ninit-command=SET SESSION MAX_EXECUTION_TIME=0\n");
+        file_put_contents($optFile, "[mysqldump]\n");
 
         try {
             // ── Phase 1: schema dump (no data) ──────────────────────────────
@@ -1126,6 +1126,7 @@ class MigrationService
                 .' --no-data'
                 .' --add-drop-table'
                 .' --no-tablespaces'
+                .' --set-gtid-purged=OFF'
                 .' --ssl-mode=DISABLED'
                 .' -h '.escapeshellarg($srcConn['hostname'])
                 .' -P '.(int) $srcConn['port']
@@ -1307,6 +1308,7 @@ class MigrationService
                     .' --single-transaction'
                     .' --no-tablespaces'
                     .' --no-create-info'   // schema already imported in phase 1
+                    .' --set-gtid-purged=OFF'
                     .' --max-allowed-packet=64M'
                     .' --ssl-mode=DISABLED'
                     .' -h '.escapeshellarg($srcConn['hostname'])

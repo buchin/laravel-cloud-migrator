@@ -21,7 +21,7 @@ class MigrateDbCommand extends Command
                             {--skip-data=* : Skip data migration for specific schemas (e.g. --skip-data=nerd)}
                             {--ignore-table=* : Exclude specific tables, format: schema.table (e.g. --ignore-table=dojo.nerd_daily_report_urls)}
                             {--concurrency=4 : Parallel table dump workers for MySQL (default: 4)}
-                            {--verbose : Show per-table progress lines (default: schema-level summary only)}
+                            {--show-tables : Show per-table progress lines (default: schema-level summary only)}
                             {--yes : Skip confirmation prompt and proceed automatically}';
 
     protected $description = 'Migrate database data between organizations (for apps already migrated)';
@@ -129,7 +129,7 @@ class MigrateDbCommand extends Command
 
         $service = new MigrationService($source, $target);
         $anyFailed = false;
-        $verbose = (bool) $this->option('verbose');
+        $verbose = (bool) $this->option('show-tables');
         $concurrency = max(1, (int) ($this->option('concurrency') ?? 4));
 
         foreach ($pairs as $pair) {

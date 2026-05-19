@@ -74,7 +74,7 @@ cloud-migrator app:migrate --app=myapp --source-token=xxx --target-token=yyy --y
 
 **What gets migrated:** application, environments, environment variables, database clusters and schemas, cache clusters, instances, background processes, custom domains.
 
-**What does NOT get migrated automatically:** database data (use `--migrate-db`), object storage bucket contents.
+**What does NOT get migrated automatically:** database data (use `--migrate-db`), object storage bucket contents, Laravel Cloud vanity domains (`*.laravel.cloud` — cannot be transferred via API; transfer manually by changing the source vanity in the dashboard first, then setting the desired vanity on the target).
 
 ---
 

@@ -25,7 +25,7 @@ class TransferVanityCommand extends Command
                             {--delete-source : Delete the source app to immediately release the vanity domain}
                             {--yes : Skip confirmation prompts}';
 
-    protected $description = 'Transfer the Laravel Cloud vanity domain from the source app to the matching target app';
+    protected $description = 'Move custom domains from source to target app (note: *.laravel.cloud vanity domains are org-specific and cannot be transferred)';
 
     public function handle(): int
     {
@@ -149,7 +149,11 @@ class TransferVanityCommand extends Command
 
         // ── Show plan ─────────────────────────────────────────────────────────
         $this->newLine();
-        $this->line('<fg=cyan;options=bold>Vanity Domain Transfer</>');
+        $this->line('<fg=yellow>⚠  Note:</> <fg=cyan>*.laravel.cloud</> vanity domains cannot be transferred via API.');
+        $this->line('   To transfer manually: change source vanity in the dashboard first, then set the desired vanity on the target.');
+        $this->line('   This command moves <fg=cyan>custom domains</> only.');
+        $this->newLine();
+        $this->line('<fg=cyan;options=bold>Custom Domain Transfer</>');
         $this->line(str_repeat('─', 55));
         $this->line("  App:            {$appName}");
         $this->line("  Source slug:    {$sourceSlug}");

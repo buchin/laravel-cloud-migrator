@@ -405,6 +405,8 @@ class MigrateCommand extends Command
         if (! $moveDomains) {
             $this->line('<fg=gray>Domains and DNS records will NOT be migrated.</>');
         }
+        $this->line('<fg=gray>*.laravel.cloud vanity domain cannot be transferred — the new app will receive a new vanity URL.</>');
+
         $this->newLine();
     }
 }
