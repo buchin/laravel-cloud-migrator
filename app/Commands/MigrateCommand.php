@@ -382,6 +382,9 @@ class MigrateCommand extends Command
             if (($plan->hasDeployments[$env->id] ?? false) && ! $deploy) {
                 $this->line('  <fg=yellow>⚑ Source has been deployed — add <options=bold>--deploy</> to trigger on target</>');
             }
+            if ($env->phpVersion) {
+                $this->line("  <fg=yellow>⚑ Source PHP: {$env->phpVersion} — verify target org default matches, or update dependencies if it differs</>");
+            }
 
             $this->newLine();
         }

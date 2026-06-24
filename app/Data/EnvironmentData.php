@@ -30,7 +30,7 @@ class EnvironmentData
             name: $attrs['name'],
             slug: $attrs['slug'],
             branch: $attrs['branch'] ?? 'main',
-            phpVersion: $attrs['php_version'] ?? null,
+            phpVersion: $attrs['php_major_version'] ?? null,
             nodeVersion: $attrs['node_version'] ?? null,
             buildCommand: $attrs['build_command'] ?? null,
             deployCommand: $attrs['deploy_command'] ?? null,

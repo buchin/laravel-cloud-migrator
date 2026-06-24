@@ -315,7 +315,7 @@ class MigrationService
 
             // Patch environment settings
             $patch = array_filter([
-                'php_version' => $env->phpVersion,
+                'php_version' => $env->phpVersion ? "{$env->phpVersion}:1" : null,
                 'node_version' => $env->nodeVersion,
                 'build_command' => $env->buildCommand,
                 'deploy_command' => $env->deployCommand,
