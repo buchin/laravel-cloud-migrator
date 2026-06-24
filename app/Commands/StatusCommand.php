@@ -149,7 +149,8 @@ class StatusCommand extends Command
                 $tgtDomains = $this->fetchDomainCount($target, $tgtEnv['id']);
                 if ($srcDomains === 0 && $tgtDomains === 0) {
                     // No domains on either side — skip
-                } elseif ($srcDomains === $tgtDomains) {
+                } elseif ($srcDomains === $tgtDomains || ($srcDomains === 0 && $tgtDomains > 0)) {
+                    // Counts match, or domains were moved (source now empty, target has them)
                     $this->line("    <fg=green>✓</> Domains: {$tgtDomains}/{$srcDomains}");
                 } else {
                     $this->line("    <fg=yellow>⚠</> Domains: {$tgtDomains}/{$srcDomains} — <fg=yellow>not all moved</>");
