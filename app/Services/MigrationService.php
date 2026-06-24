@@ -348,8 +348,10 @@ class MigrationService
 
             // Database
             if (isset($plan->databases[$env->id])) {
-                $progress('  Creating database cluster...');
                 $dbInfo = $plan->databases[$env->id];
+                $clusterName = $dbInfo['cluster']['attributes']['name'] ?? 'cluster';
+                $alreadyHaveCluster = isset($this->clusterRegistry[$dbInfo['cluster']['id']]);
+                $progress($alreadyHaveCluster ? "  Reusing database cluster: {$clusterName}..." : "  Creating database cluster...");
                 $newDatabaseSchemaId = $this->migrateDatabase($dbInfo, $newEnvId);
 
                 $sourceConn = $dbInfo['cluster']['attributes']['connection'] ?? null;
@@ -370,8 +372,10 @@ class MigrationService
 
             // Cache
             if (isset($plan->caches[$env->id])) {
-                $progress('  Creating cache...');
                 $cacheData = $plan->caches[$env->id];
+                $cacheName = $cacheData['attributes']['name'] ?? 'cache';
+                $alreadyHaveCache = isset($this->cacheRegistry[$cacheData['id']]);
+                $progress($alreadyHaveCache ? "  Reusing cache: {$cacheName}..." : "  Creating cache...");
                 $newCacheId = $this->migrateCache($cacheData);
             }
 
@@ -685,43 +689,46 @@ class MigrationService
         if (isset($this->clusterRegistry[$sourceClusterId])) {
             $newClusterId = $this->clusterRegistry[$sourceClusterId];
         } else {
-            try {
-                $newCluster = $this->target->post('databases/clusters', [
-                    'type' => $attrs['type'],
-                    'name' => $attrs['name'],
-                    'region' => $attrs['region'],
-                    'config' => $attrs['config'] ?? [],
-                ]);
-                $newClusterId = $newCluster['data']['id'];
-                $this->lastCreatedClusterId = $newClusterId;
-            } catch (\RuntimeException) {
-                // Already exists — find it in target by name (retry or shared-cluster scenario).
-                $existing = $this->target->getAll('databases/clusters');
-                $match = null;
-                foreach ($existing as $c) {
-                    if (($c['attributes']['name'] ?? '') === $attrs['name']) {
-                        $match = $c;
-                        break;
-                    }
+            // Check if a cluster with the same name already exists in the target org
+            // (e.g. a previous app:migrate run already created it for a shared cluster).
+            $existing = $this->target->getAll('databases/clusters');
+            $existingMatch = null;
+            foreach ($existing as $c) {
+                if (($c['attributes']['name'] ?? '') === $attrs['name']) {
+                    $existingMatch = $c;
+                    break;
                 }
-                if (! $match) {
+            }
+
+            if ($existingMatch) {
+                $newClusterId = $existingMatch['id'];
+            } else {
+                try {
+                    $newCluster = $this->target->post('databases/clusters', [
+                        'type' => $attrs['type'],
+                        'name' => $attrs['name'],
+                        'region' => $attrs['region'],
+                        'config' => $attrs['config'] ?? [],
+                    ]);
+                    $newClusterId = $newCluster['data']['id'];
+                    $this->lastCreatedClusterId = $newClusterId;
+                } catch (\RuntimeException) {
                     throw new \RuntimeException("Could not create or find cluster \"{$attrs['name']}\" in target org.");
                 }
-                $newClusterId = $match['id'];
+
+                // Wait for the newly created cluster to finish provisioning.
+                $waited = 0;
+                while ($waited < 300) {
+                    $status = $this->target->get("databases/clusters/{$newClusterId}")['data']['attributes']['status'] ?? 'unknown';
+                    if ($status === 'available') {
+                        break;
+                    }
+                    sleep(5);
+                    $waited += 5;
+                }
             }
 
             $this->clusterRegistry[$sourceClusterId] = $newClusterId;
-
-            // Wait for the cluster to finish provisioning before touching its schemas.
-            $waited = 0;
-            while ($waited < 300) {
-                $status = $this->target->get("databases/clusters/{$newClusterId}")['data']['attributes']['status'] ?? 'unknown';
-                if ($status === 'available') {
-                    break;
-                }
-                sleep(5);
-                $waited += 5;
-            }
         }
 
         $schemaAttrs = $schema['attributes'];
@@ -1426,30 +1433,36 @@ class MigrationService
         if (! isset($this->cacheRegistry[$sourceCacheId])) {
             $attrs = $cacheData['attributes'];
 
-            $payload = array_filter([
-                'type' => $attrs['type'],
-                'name' => $attrs['name'],
-                'region' => $attrs['region'],
-                'size' => $attrs['size'],
-                'auto_upgrade_enabled' => $attrs['auto_upgrade_enabled'] ?? false,
-                'is_public' => $attrs['is_public'] ?? false,
-                'eviction_policy' => $attrs['eviction_policy'] ?? null,
-            ], fn ($v) => $v !== null);
-
-            try {
-                $newCache = $this->target->post('caches', $payload);
-                $newCacheId = $newCache['data']['id'] ?? null;
-            } catch (\RuntimeException) {
-                // Already exists — find it in target by name (retry or shared-cache scenario).
-                $existing = $this->target->getAll('caches');
-                $match = null;
-                foreach ($existing as $c) {
-                    if (($c['attributes']['name'] ?? '') === $attrs['name']) {
-                        $match = $c;
-                        break;
-                    }
+            // Check if a cache with the same name already exists in the target org
+            // (e.g. a previous app:migrate run already created it for a shared cache).
+            $existing = $this->target->getAll('caches');
+            $existingMatch = null;
+            foreach ($existing as $c) {
+                if (($c['attributes']['name'] ?? '') === $attrs['name']) {
+                    $existingMatch = $c;
+                    break;
                 }
-                $newCacheId = $match['id'] ?? null;
+            }
+
+            if ($existingMatch) {
+                $newCacheId = $existingMatch['id'];
+            } else {
+                $payload = array_filter([
+                    'type' => $attrs['type'],
+                    'name' => $attrs['name'],
+                    'region' => $attrs['region'],
+                    'size' => $attrs['size'],
+                    'auto_upgrade_enabled' => $attrs['auto_upgrade_enabled'] ?? false,
+                    'is_public' => $attrs['is_public'] ?? false,
+                    'eviction_policy' => $attrs['eviction_policy'] ?? null,
+                ], fn ($v) => $v !== null);
+
+                try {
+                    $newCache = $this->target->post('caches', $payload);
+                    $newCacheId = $newCache['data']['id'] ?? null;
+                } catch (\RuntimeException) {
+                    $newCacheId = null;
+                }
             }
 
             if (! $newCacheId) {
