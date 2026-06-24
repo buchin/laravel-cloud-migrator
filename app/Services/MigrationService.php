@@ -355,10 +355,10 @@ class MigrationService
             if (isset($existingEnvs[$env->name])) {
                 $newEnvId = $existingEnvs[$env->name];
             } else {
-                $newEnv = $this->target->post("applications/{$newAppId}/environments", array_filter([
+                $newEnv = $this->target->post("applications/{$newAppId}/environments", [
                     'name' => $env->name,
-                    'branch' => $env->branch,
-                ], fn ($v) => $v !== null));
+                    'branch' => $env->branch ?? $env->name,
+                ]);
                 $newEnvId = $newEnv['data']['id'];
             }
 
