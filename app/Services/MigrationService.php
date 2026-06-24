@@ -266,6 +266,56 @@ class MigrationService
         return false;
     }
 
+    private function prefillRegistriesFromTarget(MigrationPlan $plan): void
+    {
+        // Collect the cluster and cache names this plan needs.
+        $neededClusterNames = [];
+        $neededCacheNames = [];
+
+        foreach ($plan->environments as $env) {
+            if (isset($plan->databases[$env->id])) {
+                $name = $plan->databases[$env->id]['cluster']['attributes']['name'] ?? null;
+                $sourceId = $plan->databases[$env->id]['cluster']['id'] ?? null;
+                if ($name && $sourceId) {
+                    $neededClusterNames[$name] = $sourceId;
+                }
+            }
+            if (isset($plan->caches[$env->id])) {
+                $name = $plan->caches[$env->id]['attributes']['name'] ?? null;
+                $sourceId = $plan->caches[$env->id]['id'] ?? null;
+                if ($name && $sourceId) {
+                    $neededCacheNames[$name] = $sourceId;
+                }
+            }
+        }
+
+        // Pre-populate cluster registry from existing target clusters.
+        if ($neededClusterNames) {
+            foreach ($this->target->getAll('databases/clusters') as $c) {
+                $name = $c['attributes']['name'] ?? null;
+                if ($name && isset($neededClusterNames[$name])) {
+                    $sourceId = $neededClusterNames[$name];
+                    if (! isset($this->clusterRegistry[$sourceId])) {
+                        $this->clusterRegistry[$sourceId] = $c['id'];
+                    }
+                }
+            }
+        }
+
+        // Pre-populate cache registry from existing target caches.
+        if ($neededCacheNames) {
+            foreach ($this->target->getAll('caches') as $c) {
+                $name = $c['attributes']['name'] ?? null;
+                if ($name && isset($neededCacheNames[$name])) {
+                    $sourceId = $neededCacheNames[$name];
+                    if (! isset($this->cacheRegistry[$sourceId])) {
+                        $this->cacheRegistry[$sourceId] = $c['id'];
+                    }
+                }
+            }
+        }
+    }
+
     public function execute(MigrationPlan $plan, callable $progress): string
     {
         $this->lastCreatedAppId = null;
@@ -273,6 +323,8 @@ class MigrationService
         $this->envIdMap = [];
         $this->envNameMap = [];
         $this->dbDataMap = [];
+
+        $this->prefillRegistriesFromTarget($plan);
 
         $progress('Creating application...');
         $app = $plan->application;
@@ -685,47 +737,32 @@ class MigrationService
         $attrs = $cluster['attributes'];
         $sourceClusterId = $cluster['id'];
 
-        // Reuse an already-migrated target cluster (shared cluster scenario).
+        // Reuse an already-registered target cluster (pre-filled by prefillRegistriesFromTarget or a prior env).
         if (isset($this->clusterRegistry[$sourceClusterId])) {
             $newClusterId = $this->clusterRegistry[$sourceClusterId];
         } else {
-            // Check if a cluster with the same name already exists in the target org
-            // (e.g. a previous app:migrate run already created it for a shared cluster).
-            $existing = $this->target->getAll('databases/clusters');
-            $existingMatch = null;
-            foreach ($existing as $c) {
-                if (($c['attributes']['name'] ?? '') === $attrs['name']) {
-                    $existingMatch = $c;
-                    break;
-                }
+            try {
+                $newCluster = $this->target->post('databases/clusters', [
+                    'type' => $attrs['type'],
+                    'name' => $attrs['name'],
+                    'region' => $attrs['region'],
+                    'config' => $attrs['config'] ?? [],
+                ]);
+                $newClusterId = $newCluster['data']['id'];
+                $this->lastCreatedClusterId = $newClusterId;
+            } catch (\RuntimeException) {
+                throw new \RuntimeException("Could not create or find cluster \"{$attrs['name']}\" in target org.");
             }
 
-            if ($existingMatch) {
-                $newClusterId = $existingMatch['id'];
-            } else {
-                try {
-                    $newCluster = $this->target->post('databases/clusters', [
-                        'type' => $attrs['type'],
-                        'name' => $attrs['name'],
-                        'region' => $attrs['region'],
-                        'config' => $attrs['config'] ?? [],
-                    ]);
-                    $newClusterId = $newCluster['data']['id'];
-                    $this->lastCreatedClusterId = $newClusterId;
-                } catch (\RuntimeException) {
-                    throw new \RuntimeException("Could not create or find cluster \"{$attrs['name']}\" in target org.");
+            // Wait for the newly created cluster to finish provisioning.
+            $waited = 0;
+            while ($waited < 300) {
+                $status = $this->target->get("databases/clusters/{$newClusterId}")['data']['attributes']['status'] ?? 'unknown';
+                if ($status === 'available') {
+                    break;
                 }
-
-                // Wait for the newly created cluster to finish provisioning.
-                $waited = 0;
-                while ($waited < 300) {
-                    $status = $this->target->get("databases/clusters/{$newClusterId}")['data']['attributes']['status'] ?? 'unknown';
-                    if ($status === 'available') {
-                        break;
-                    }
-                    sleep(5);
-                    $waited += 5;
-                }
+                sleep(5);
+                $waited += 5;
             }
 
             $this->clusterRegistry[$sourceClusterId] = $newClusterId;
@@ -1433,36 +1470,21 @@ class MigrationService
         if (! isset($this->cacheRegistry[$sourceCacheId])) {
             $attrs = $cacheData['attributes'];
 
-            // Check if a cache with the same name already exists in the target org
-            // (e.g. a previous app:migrate run already created it for a shared cache).
-            $existing = $this->target->getAll('caches');
-            $existingMatch = null;
-            foreach ($existing as $c) {
-                if (($c['attributes']['name'] ?? '') === $attrs['name']) {
-                    $existingMatch = $c;
-                    break;
-                }
-            }
+            $payload = array_filter([
+                'type' => $attrs['type'],
+                'name' => $attrs['name'],
+                'region' => $attrs['region'],
+                'size' => $attrs['size'],
+                'auto_upgrade_enabled' => $attrs['auto_upgrade_enabled'] ?? false,
+                'is_public' => $attrs['is_public'] ?? false,
+                'eviction_policy' => $attrs['eviction_policy'] ?? null,
+            ], fn ($v) => $v !== null);
 
-            if ($existingMatch) {
-                $newCacheId = $existingMatch['id'];
-            } else {
-                $payload = array_filter([
-                    'type' => $attrs['type'],
-                    'name' => $attrs['name'],
-                    'region' => $attrs['region'],
-                    'size' => $attrs['size'],
-                    'auto_upgrade_enabled' => $attrs['auto_upgrade_enabled'] ?? false,
-                    'is_public' => $attrs['is_public'] ?? false,
-                    'eviction_policy' => $attrs['eviction_policy'] ?? null,
-                ], fn ($v) => $v !== null);
-
-                try {
-                    $newCache = $this->target->post('caches', $payload);
-                    $newCacheId = $newCache['data']['id'] ?? null;
-                } catch (\RuntimeException) {
-                    $newCacheId = null;
-                }
+            try {
+                $newCache = $this->target->post('caches', $payload);
+                $newCacheId = $newCache['data']['id'] ?? null;
+            } catch (\RuntimeException) {
+                $newCacheId = null;
             }
 
             if (! $newCacheId) {
