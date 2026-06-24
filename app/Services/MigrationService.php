@@ -475,6 +475,18 @@ class MigrationService
             }
         }
 
+        // Delete any auto-created environments that were not used by the migration.
+        $usedEnvIds = array_values($this->envIdMap);
+        foreach ($existingEnvs as $envId) {
+            if (! in_array($envId, $usedEnvIds)) {
+                try {
+                    $this->target->delete("environments/{$envId}");
+                } catch (\RuntimeException) {
+                    // Non-fatal — orphaned env stays but won't affect functionality.
+                }
+            }
+        }
+
         return $newApp['data']['attributes']['slug'];
     }
 
