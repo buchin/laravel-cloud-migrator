@@ -353,7 +353,15 @@ class MigrationService
             $progress("Creating environment: {$env->name}...");
 
             if (isset($existingEnvs[$env->name])) {
+                // Exact name match — reuse as-is.
                 $newEnvId = $existingEnvs[$env->name];
+                unset($existingEnvs[$env->name]);
+            } elseif (! empty($existingEnvs)) {
+                // No name match — rename the first auto-created env rather than
+                // creating a new one. Avoids orphaned envs that can't be deleted
+                // because the API prevents deleting the "production" environment.
+                $newEnvId = array_shift($existingEnvs);
+                $this->target->patch("environments/{$newEnvId}", ['name' => $env->name]);
             } else {
                 $newEnv = $this->target->post("applications/{$newAppId}/environments", [
                     'name' => $env->name,
@@ -471,18 +479,6 @@ class MigrationService
                         'command' => $pAttrs['command'] ?? null,
                         'config' => $pAttrs['config'] ?? null,
                     ], fn ($v) => $v !== null));
-                }
-            }
-        }
-
-        // Delete any auto-created environments that were not used by the migration.
-        $usedEnvIds = array_values($this->envIdMap);
-        foreach ($existingEnvs as $envId) {
-            if (! in_array($envId, $usedEnvIds)) {
-                try {
-                    $this->target->delete("environments/{$envId}");
-                } catch (\RuntimeException) {
-                    // Non-fatal — orphaned env stays but won't affect functionality.
                 }
             }
         }
