@@ -302,7 +302,8 @@ class MigrateCommand extends Command
         $this->newLine();
 
         foreach ($plan->environments as $env) {
-            $this->line("<fg=cyan>Environment: {$env->name}</> (branch: {$env->branch})");
+            $branchLabel = $env->branch ? " (branch: {$env->branch})" : '';
+            $this->line("<fg=cyan>Environment: {$env->name}</>{$branchLabel}");
 
             if ($env->phpVersion) {
                 $this->line("  PHP: {$env->phpVersion}");
