@@ -163,7 +163,7 @@ class StatusCommand extends Command
                     $srcInfo = $sourceConnMap[$schemaId];
                     $dbName = $srcInfo['db_name'];
                     $srcConn = $srcInfo['connection'];
-                    $tgtConn = $targetConnMap[$dbName] ?? null;
+                    $tgtConn = $targetConnMap["{$srcInfo['cluster_name']}.{$dbName}"] ?? null;
 
                     $srcRows = $this->getRowCount($srcConn, $dbName);
                     $tgtRows = $tgtConn ? $this->getRowCount($tgtConn, $dbName) : null;
@@ -273,6 +273,7 @@ class StatusCommand extends Command
 
         foreach ($clusters as $cluster) {
             $conn = $cluster['attributes']['connection'] ?? null;
+            $clusterName = $cluster['attributes']['name'] ?? $cluster['id'];
             if (! $conn) {
                 continue;
             }
@@ -283,6 +284,7 @@ class StatusCommand extends Command
                     $map[$schema['id']] = [
                         'connection' => $conn,
                         'db_name' => $schema['attributes']['name'],
+                        'cluster_name' => $clusterName,
                     ];
                 }
             } catch (RuntimeException) {
@@ -292,6 +294,7 @@ class StatusCommand extends Command
         return $map;
     }
 
+    /** target "clusterName.schemaName" → connection */
     private function buildTargetConnMap(CloudApiClient $target): array
     {
         $map = [];
@@ -304,6 +307,7 @@ class StatusCommand extends Command
 
         foreach ($clusters as $cluster) {
             $conn = $cluster['attributes']['connection'] ?? null;
+            $clusterName = $cluster['attributes']['name'] ?? $cluster['id'];
             if (! $conn) {
                 continue;
             }
@@ -311,7 +315,7 @@ class StatusCommand extends Command
             try {
                 $schemas = $target->getAll("databases/clusters/{$cluster['id']}/databases");
                 foreach ($schemas as $schema) {
-                    $map[$schema['attributes']['name']] = $conn;
+                    $map["{$clusterName}.{$schema['attributes']['name']}"] = $conn;
                 }
             } catch (RuntimeException) {
             }

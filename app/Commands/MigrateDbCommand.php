@@ -72,19 +72,20 @@ class MigrateDbCommand extends Command
         $pairs = [];
         $unmatched = [];
 
-        foreach ($sourcePairs as $schemaName => $srcInfo) {
+        foreach ($sourcePairs as $key => $srcInfo) {
+            $schemaName = $srcInfo['schema_name'];
             if (in_array($schemaName, $skipSchemas, true)) {
                 continue;
             }
-            if (isset($targetConnMap[$schemaName])) {
+            if (isset($targetConnMap[$key])) {
                 $pairs[] = [
                     'schema' => $schemaName,
                     'src_conn' => $srcInfo['connection'],
-                    'tgt_conn' => $targetConnMap[$schemaName],
+                    'tgt_conn' => $targetConnMap[$key],
                     'db_type' => $srcInfo['type'],
                 ];
             } else {
-                $unmatched[] = $schemaName;
+                $unmatched[] = $key;
             }
         }
 
@@ -188,7 +189,7 @@ class MigrateDbCommand extends Command
         return $anyFailed ? self::FAILURE : self::SUCCESS;
     }
 
-    /** source schemaName → {connection, type} */
+    /** source "clusterName.schemaName" → {connection, type, schema_name} */
     private function buildSourcePairs(CloudApiClient $source): array
     {
         $map = [];
@@ -202,6 +203,7 @@ class MigrateDbCommand extends Command
         foreach ($clusters as $cluster) {
             $conn = $cluster['attributes']['connection'] ?? null;
             $type = $cluster['attributes']['type'] ?? 'mysql';
+            $clusterName = $cluster['attributes']['name'] ?? $cluster['id'];
             if (! $conn) {
                 continue;
             }
@@ -209,9 +211,11 @@ class MigrateDbCommand extends Command
             try {
                 $schemas = $source->getAll("databases/clusters/{$cluster['id']}/databases");
                 foreach ($schemas as $schema) {
-                    $map[$schema['attributes']['name']] = [
+                    $schemaName = $schema['attributes']['name'];
+                    $map["{$clusterName}.{$schemaName}"] = [
                         'connection' => $conn,
                         'type' => $type,
+                        'schema_name' => $schemaName,
                     ];
                 }
             } catch (RuntimeException) {
@@ -221,7 +225,7 @@ class MigrateDbCommand extends Command
         return $map;
     }
 
-    /** target schemaName → connection */
+    /** target "clusterName.schemaName" → connection */
     private function buildTargetConnMap(CloudApiClient $target): array
     {
         $map = [];
@@ -234,6 +238,7 @@ class MigrateDbCommand extends Command
 
         foreach ($clusters as $cluster) {
             $conn = $cluster['attributes']['connection'] ?? null;
+            $clusterName = $cluster['attributes']['name'] ?? $cluster['id'];
             if (! $conn) {
                 continue;
             }
@@ -258,7 +263,7 @@ class MigrateDbCommand extends Command
             try {
                 $schemas = $target->getAll("databases/clusters/{$cluster['id']}/databases");
                 foreach ($schemas as $schema) {
-                    $map[$schema['attributes']['name']] = $conn;
+                    $map["{$clusterName}.{$schema['attributes']['name']}"] = $conn;
                 }
             } catch (RuntimeException) {
             }

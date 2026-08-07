@@ -365,7 +365,7 @@ class MigrationService
             } else {
                 $newEnv = $this->target->post("applications/{$newAppId}/environments", [
                     'name' => $env->name,
-                    'branch' => $env->branch ?? $env->name,
+                    'branch' => $env->branch ?? 'main',
                 ]);
                 $newEnvId = $newEnv['data']['id'];
             }
@@ -411,7 +411,7 @@ class MigrationService
                 $dbInfo = $plan->databases[$env->id];
                 $clusterName = $dbInfo['cluster']['attributes']['name'] ?? 'cluster';
                 $alreadyHaveCluster = isset($this->clusterRegistry[$dbInfo['cluster']['id']]);
-                $progress($alreadyHaveCluster ? "  Reusing database cluster: {$clusterName}..." : "  Creating database cluster...");
+                $progress($alreadyHaveCluster ? "  Reusing database cluster: {$clusterName}..." : '  Creating database cluster...');
                 $newDatabaseSchemaId = $this->migrateDatabase($dbInfo, $newEnvId);
 
                 $sourceConn = $dbInfo['cluster']['attributes']['connection'] ?? null;
@@ -435,8 +435,8 @@ class MigrationService
                 $cacheData = $plan->caches[$env->id];
                 $cacheName = $cacheData['attributes']['name'] ?? 'cache';
                 $alreadyHaveCache = isset($this->cacheRegistry[$cacheData['id']]);
-                $progress($alreadyHaveCache ? "  Reusing cache: {$cacheName}..." : "  Creating cache...");
-                $newCacheId = $this->migrateCache($cacheData);
+                $progress($alreadyHaveCache ? "  Reusing cache: {$cacheName}..." : '  Creating cache...');
+                $newCacheId = $this->migrateCache($cacheData, $progress);
             }
 
             // Link database and cache
@@ -758,8 +758,8 @@ class MigrationService
                 ]);
                 $newClusterId = $newCluster['data']['id'];
                 $this->lastCreatedClusterId = $newClusterId;
-            } catch (\RuntimeException) {
-                throw new \RuntimeException("Could not create or find cluster \"{$attrs['name']}\" in target org.");
+            } catch (\RuntimeException $e) {
+                throw new \RuntimeException("Could not create or find cluster \"{$attrs['name']}\" in target org: {$e->getMessage()}");
             }
 
             // Wait for the newly created cluster to finish provisioning.
@@ -1180,6 +1180,7 @@ class MigrationService
                 .' --no-tablespaces'
                 .' --set-gtid-purged=OFF'
                 .' --ssl-mode=DISABLED'
+                .' --compression-algorithms=zlib,uncompressed'
                 .' -h '.escapeshellarg($srcConn['hostname'])
                 .' -P '.(int) $srcConn['port']
                 .' -u '.escapeshellarg($srcConn['username'])
@@ -1203,6 +1204,7 @@ class MigrationService
             $schemaImportCmd = escapeshellarg($importBin)
                 .' --ssl-mode=DISABLED'
                 .' --max-allowed-packet=64M'
+                .' --compression-algorithms=zlib,uncompressed'
                 .' --init-command='.escapeshellarg('SET SESSION foreign_key_checks=0')
                 .' -h '.escapeshellarg($tgtConn['hostname'])
                 .' -P '.(int) $tgtConn['port']
@@ -1334,7 +1336,8 @@ class MigrationService
             .' --force'
             .' --max-allowed-packet=64M'
             .' --ssl-mode=DISABLED'
-            .' --init-command='.escapeshellarg('SET SESSION foreign_key_checks=0, wait_timeout=28800, net_read_timeout=3600, net_write_timeout=3600')
+            .' --compression-algorithms=zlib,uncompressed'
+            .' --init-command='.escapeshellarg('SET SESSION foreign_key_checks=0, unique_checks=0, wait_timeout=28800, net_read_timeout=3600, net_write_timeout=3600')
             .' -h '.escapeshellarg($tgtConn['hostname'])
             .' -P '.(int) $tgtConn['port']
             .' -u '.escapeshellarg($tgtConn['username'])
@@ -1363,6 +1366,7 @@ class MigrationService
                     .' --set-gtid-purged=OFF'
                     .' --max-allowed-packet=64M'
                     .' --ssl-mode=DISABLED'
+                    .' --compression-algorithms=zlib,uncompressed'
                     .' -h '.escapeshellarg($srcConn['hostname'])
                     .' -P '.(int) $srcConn['port']
                     .' -u '.escapeshellarg($srcConn['username'])
@@ -1471,7 +1475,7 @@ class MigrationService
         }
     }
 
-    private function migrateCache(array $cacheData): ?string
+    private function migrateCache(array $cacheData, ?callable $progress = null): ?string
     {
         $sourceCacheId = $cacheData['id'];
 
@@ -1491,7 +1495,10 @@ class MigrationService
             try {
                 $newCache = $this->target->post('caches', $payload);
                 $newCacheId = $newCache['data']['id'] ?? null;
-            } catch (\RuntimeException) {
+            } catch (\RuntimeException $e) {
+                if ($progress) {
+                    $progress("  Could not create cache \"{$attrs['name']}\": {$e->getMessage()}");
+                }
                 $newCacheId = null;
             }
 
