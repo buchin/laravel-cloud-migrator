@@ -328,6 +328,16 @@ class MigrationManifest
     }
 
     /**
+     * Get all environment resolvers defined in manifest.
+     *
+     * @return array<string, array<string, string>|string>
+     */
+    public function getAllEnvResolvers(): array
+    {
+        return $this->envResolvers;
+    }
+
+    /**
      * Get storage bucket migration configurations defined in manifest.
      *
      * @return array<int, array{source_bucket: string, target_bucket: string, prefix: string, source_region: ?string, target_region: ?string, source_endpoint: ?string, target_endpoint: ?string}>

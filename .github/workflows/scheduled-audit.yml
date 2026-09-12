@@ -1,0 +1,64 @@
+name: Scheduled Organization Audit & Drift Detection
+
+on:
+  schedule:
+    # Run every 6 hours (at 00:00, 06:00, 12:00, 18:00 UTC)
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      fail_on_warning:
+        description: 'Fail workflow on warnings'
+        required: false
+        type: boolean
+        default: false
+      export_filename:
+        description: 'JSON report filename'
+        required: false
+        type: string
+        default: 'audit-report.json'
+
+jobs:
+  audit:
+    name: Run Organization Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: mbstring, xml, pdo, pdo_mysql, curl
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress --no-interaction
+
+      - name: Run org:audit
+        id: run_audit
+        env:
+          CLOUD_TARGET_TOKEN: ${{ secrets.CLOUD_TARGET_TOKEN }}
+          CLOUD_SOURCE_TOKEN: ${{ secrets.CLOUD_SOURCE_TOKEN }}
+        run: |
+          REPORT_FILE="${{ github.event.inputs.export_filename || 'audit-report.json' }}"
+          FAIL_FLAG=""
+          if [ "${{ github.event.inputs.fail_on_warning }}" = "true" ]; then
+            FAIL_FLAG="--fail-on-warning"
+          fi
+
+          ./cloud-migrator org:audit \
+            --target-token="${CLOUD_TARGET_TOKEN}" \
+            --manifest=migration-plan.json \
+            --json="${REPORT_FILE}" \
+            ${FAIL_FLAG} \
+            --yes
+
+      - name: Upload audit report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: org-audit-report
+          path: ${{ github.event.inputs.export_filename || 'audit-report.json' }}
+          retention-days: 30
