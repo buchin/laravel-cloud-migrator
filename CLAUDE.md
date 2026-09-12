@@ -42,6 +42,7 @@ Three layers:
 | `org:health` | `HealthCommand` | HTTP health check for all environments in an org |
 | `org:status` | `StatusCommand` | Side-by-side comparison of source vs target (env vars, DB rows, deployments) |
 | `vanity:transfer` | `TransferVanityCommand` | Transfer `*.laravel.cloud` vanity slug from source to target |
+| `storage:sync` | `SyncStorageCommand` | Multi-bucket S3 object storage streaming sync with checksum verification |
 | `org:decommission` | `DecommissionCommand` | Delete source apps after confirming they exist in target |
 | `app:list` | `ListCommand` | List all apps in an org |
 

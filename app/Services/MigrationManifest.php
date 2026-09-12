@@ -18,6 +18,9 @@ class MigrationManifest
     /** @var array<string, array<string, string>|string> */
     private array $envResolvers = [];
 
+    /** @var array<int, array{source_bucket: string, target_bucket: string, prefix?: string, source_region?: string, target_region?: string}> */
+    private array $storageBuckets = [];
+
     private array $raw = [];
 
     public function __construct(array $data = [], ?string $filePath = null)
@@ -107,6 +110,50 @@ class MigrationManifest
         }
 
         $this->envResolvers = $envResolvers;
+
+        // Parse storage section if present
+        $storage = $data['storage'] ?? [];
+        if (is_array($storage)) {
+            if (array_is_list($storage)) {
+                foreach ($storage as $entry) {
+                    if (is_array($entry) && isset($entry['source_bucket'], $entry['target_bucket'])) {
+                        $this->storageBuckets[] = [
+                            'source_bucket' => (string) $entry['source_bucket'],
+                            'target_bucket' => (string) $entry['target_bucket'],
+                            'prefix' => (string) ($entry['prefix'] ?? ''),
+                            'source_region' => isset($entry['source_region']) ? (string) $entry['source_region'] : null,
+                            'target_region' => isset($entry['target_region']) ? (string) $entry['target_region'] : null,
+                            'source_endpoint' => isset($entry['source_endpoint']) ? (string) $entry['source_endpoint'] : null,
+                            'target_endpoint' => isset($entry['target_endpoint']) ? (string) $entry['target_endpoint'] : null,
+                        ];
+                    }
+                }
+            } else {
+                foreach ($storage as $src => $tgt) {
+                    if (is_string($tgt)) {
+                        $this->storageBuckets[] = [
+                            'source_bucket' => (string) $src,
+                            'target_bucket' => (string) $tgt,
+                            'prefix' => '',
+                            'source_region' => null,
+                            'target_region' => null,
+                            'source_endpoint' => null,
+                            'target_endpoint' => null,
+                        ];
+                    } elseif (is_array($tgt) && isset($tgt['target_bucket'])) {
+                        $this->storageBuckets[] = [
+                            'source_bucket' => (string) $src,
+                            'target_bucket' => (string) $tgt['target_bucket'],
+                            'prefix' => (string) ($tgt['prefix'] ?? ''),
+                            'source_region' => isset($tgt['source_region']) ? (string) $tgt['source_region'] : null,
+                            'target_region' => isset($tgt['target_region']) ? (string) $tgt['target_region'] : null,
+                            'source_endpoint' => isset($tgt['source_endpoint']) ? (string) $tgt['source_endpoint'] : null,
+                            'target_endpoint' => isset($tgt['target_endpoint']) ? (string) $tgt['target_endpoint'] : null,
+                        ];
+                    }
+                }
+            }
+        }
     }
 
     public function getFilePath(): ?string
@@ -278,6 +325,16 @@ class MigrationManifest
         }
 
         return $directVars;
+    }
+
+    /**
+     * Get storage bucket migration configurations defined in manifest.
+     *
+     * @return array<int, array{source_bucket: string, target_bucket: string, prefix: string, source_region: ?string, target_region: ?string, source_endpoint: ?string, target_endpoint: ?string}>
+     */
+    public function getStorageBuckets(): array
+    {
+        return $this->storageBuckets;
     }
 
     public function countTotalTableRules(): int
