@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Laravel Cloud Migration Plan Manifest",
+  "description": "Declarative migration manifest schema defining per-table migration policies and cross-app environment variable resolvers.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "URI to this JSON schema"
+    },
+    "version": {
+      "type": "string",
+      "description": "Manifest schema version, e.g. 1.0"
+    },
+    "name": {
+      "type": "string",
+      "description": "Human-readable name of this migration plan"
+    },
+    "description": {
+      "type": "string",
+      "description": "Detailed description of the migration plan"
+    },
+    "databases": {
+      "type": "object",
+      "description": "Database-specific migration policy configurations keyed by schema name or cluster.schema",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "default_policy": {
+            "type": "string",
+            "enum": ["full", "schema_only", "chunked", "ignore", "transient"],
+            "default": "full"
+          },
+          "tables": {
+            "type": "object",
+            "description": "Per-table policy definitions",
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "enum": ["full", "schema_only", "chunked", "ignore", "transient"]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "policy": {
+                      "type": "string",
+                      "enum": ["full", "schema_only", "chunked", "ignore", "transient"]
+                    },
+                    "chunk_size": {
+                      "type": "integer",
+                      "minimum": 100
+                    },
+                    "threshold_rows": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "threshold_bytes": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "migrate_data": {
+                      "type": "boolean"
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  },
+                  "required": ["policy"],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "env_resolvers": {
+      "type": "object",
+      "description": "Cross-app environment variable mappings and dynamic template definitions",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "additionalProperties": true
+}

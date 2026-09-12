@@ -3,6 +3,7 @@
 namespace App\Commands;
 
 use App\Services\CloudApiClient;
+use App\Services\MigrationManifest;
 use App\Services\MigrationService;
 use App\Services\TableChunker;
 use LaravelZero\Framework\Commands\Command;
@@ -25,6 +26,7 @@ class MigrateDbCommand extends Command
                             {--concurrency=4 : Parallel table dump workers for MySQL (default: 4)}
                             {--chunk-size=50000 : Chunk size in rows for dynamic auto-chunking (default: 50000)}
                             {--show-tables : Show per-table progress lines (default: schema-level summary only)}
+                            {--manifest= : Path to declarative migration manifest file (default: migration-plan.json if exists)}
                             {--yes : Skip confirmation prompt and proceed automatically}';
 
     protected $description = 'Migrate database data between organizations (for apps already migrated)';
@@ -48,6 +50,21 @@ class MigrateDbCommand extends Command
             hint: 'Get this from cloud.laravel.com → Your Org → Settings → API Tokens',
             required: true,
         );
+
+        $manifestPath = $this->option('manifest');
+        $manifest = null;
+        if ($manifestPath) {
+            if (! file_exists($manifestPath)) {
+                error("Specified manifest file does not exist: {$manifestPath}");
+
+                return self::FAILURE;
+            }
+            $manifest = MigrationManifest::fromFile($manifestPath);
+            info("Loaded migration manifest from {$manifestPath} ({$manifest->countTotalTableRules()} table rules)");
+        } elseif (file_exists('migration-plan.json')) {
+            $manifest = MigrationManifest::fromFile('migration-plan.json');
+            info("Loaded declarative migration manifest from migration-plan.json ({$manifest->countTotalTableRules()} table rules)");
+        }
 
         $source = new CloudApiClient($sourceToken);
         $target = new CloudApiClient($targetToken);
@@ -107,13 +124,34 @@ class MigrateDbCommand extends Command
         $chunkSize = max(1000, (int) ($this->option('chunk-size') ?: TableChunker::DEFAULT_CHUNK_SIZE));
 
         foreach ($pairs as $pair) {
-            $schemaIgnoreTables = $this->resolveIgnoreTables($pair['schema'], $ignoreTables, $pair['key']);
+            $tablePolicies = $manifest ? $manifest->getTablePoliciesForSchema($pair['schema'], $pair['key']) : [];
+            $schemaIgnoreTables = $this->resolveIgnoreTables($pair['schema'], $ignoreTables, $pair['key'], $manifest);
             $ignoreNote = $schemaIgnoreTables ? ' <fg=gray>(excluding: '.implode(', ', $schemaIgnoreTables).')</>' : '';
             $this->line("  <fg=green>✓</> <fg=cyan>{$pair['key']}</>{$ignoreNote}");
 
+            // Display manifest table policies if configured
+            if (! empty($tablePolicies)) {
+                $policyNotes = [];
+                foreach ($tablePolicies as $tbl => $pol) {
+                    if ($pol->isSchemaOnly()) {
+                        $policyNotes[] = "<fg=cyan>{$tbl}</> (schema_only)";
+                    } elseif ($pol->isChunked()) {
+                        $cSize = $pol->chunkSize ?? $chunkSize;
+                        $policyNotes[] = "<fg=cyan>{$tbl}</> (chunked: {$cSize})";
+                    } elseif ($pol->isTransient()) {
+                        $policyNotes[] = "<fg=yellow>{$tbl}</> (transient)";
+                    } elseif ($pol->isIgnore()) {
+                        $policyNotes[] = "<fg=gray>{$tbl}</> (ignored)";
+                    }
+                }
+                if (! empty($policyNotes)) {
+                    $this->line('    <fg=magenta>📋</> Manifest policies: '.implode(', ', $policyNotes));
+                }
+            }
+
             // Detect large tables (>1 GB or >100k rows) in MySQL schemas
             if (! str_contains($pair['db_type'], 'pgsql') && ! str_contains($pair['db_type'], 'postgres')) {
-                $largeTables = $this->detectLargeTables($pair['src_conn'], $pair['schema'], $schemaIgnoreTables);
+                $largeTables = $this->detectLargeTables($pair['src_conn'], $pair['schema'], $schemaIgnoreTables, tablePolicies: $tablePolicies);
                 if (! empty($largeTables)) {
                     $largeCount = count($largeTables);
                     $this->line("    <fg=yellow>⚡</> Auto-chunking active: {$largeCount} table(s) exceed >1 GB or >100k rows:");
@@ -157,14 +195,15 @@ class MigrateDbCommand extends Command
             return self::SUCCESS;
         }
 
-        $service = new MigrationService($source, $target);
+        $service = new MigrationService($source, $target, manifest: $manifest);
         $anyFailed = false;
         $verbose = (bool) $this->option('show-tables');
         $concurrency = max(1, (int) ($this->option('concurrency') ?? 4));
 
         foreach ($pairs as $pair) {
             $schemaName = $pair['schema'];
-            $schemaIgnoreTables = $this->resolveIgnoreTables($schemaName, $ignoreTables, $pair['key']);
+            $tablePolicies = $manifest ? $manifest->getTablePoliciesForSchema($schemaName, $pair['key']) : [];
+            $schemaIgnoreTables = $this->resolveIgnoreTables($schemaName, $ignoreTables, $pair['key'], $manifest);
 
             $this->newLine();
             $this->line("<fg=cyan;options=bold>── {$pair['key']} ──</>");
@@ -194,6 +233,7 @@ class MigrateDbCommand extends Command
                     ignoreTables: $schemaIgnoreTables,
                     concurrency: $concurrency,
                     chunkSize: $chunkSize,
+                    tablePolicies: $tablePolicies,
                 );
 
                 if (! $verbose && $tableCount > 0) {
@@ -302,8 +342,8 @@ class MigrateDbCommand extends Command
         return $map;
     }
 
-    /** Resolve which tables to ignore for a given schema from the --ignore-table list. */
-    private function resolveIgnoreTables(string $schema, array $ignoreTables, ?string $key = null): array
+    /** Resolve which tables to ignore for a given schema from the --ignore-table list and manifest. */
+    private function resolveIgnoreTables(string $schema, array $ignoreTables, ?string $key = null, ?MigrationManifest $manifest = null): array
     {
         $result = [];
         $clusterName = $key && str_contains($key, '.') ? explode('.', $key)[0] : null;
@@ -319,6 +359,15 @@ class MigrateDbCommand extends Command
             }
         }
 
+        if ($manifest) {
+            $manifestIgnores = $manifest->getIgnoreTables($schema, $clusterName);
+            foreach ($manifestIgnores as $mTable) {
+                if (! in_array($mTable, $result, true)) {
+                    $result[] = $mTable;
+                }
+            }
+        }
+
         return $result;
     }
 
@@ -331,7 +380,8 @@ class MigrateDbCommand extends Command
         array $conn,
         string $schemaName,
         array $ignoreTables = [],
-        ?TableChunker $chunker = null
+        ?TableChunker $chunker = null,
+        array $tablePolicies = []
     ): array {
         $chunker = $chunker ?? $this->getTableChunker();
         $mysql = $this->findBinary('mysql');
@@ -340,7 +390,7 @@ class MigrateDbCommand extends Command
         }
 
         try {
-            $inspected = $chunker->inspectTables($mysql, $conn, $schemaName, $ignoreTables);
+            $inspected = $chunker->inspectTables($mysql, $conn, $schemaName, $ignoreTables, tablePolicies: $tablePolicies);
 
             return array_filter($inspected, fn (array $tableInfo) => $tableInfo['should_chunk']);
         } catch (\Throwable) {

@@ -4,6 +4,7 @@ use App\Data\ApplicationData;
 use App\Data\EnvironmentData;
 use App\Data\MigrationPlan;
 use App\Services\CloudApiClient;
+use App\Services\MigrationManifest;
 use App\Services\MigrationService;
 
 function makeApp(string $id = 'app-1', string $name = 'myapp', string $slug = 'myapp'): array
@@ -267,6 +268,82 @@ test('execute remaps API_BASE_URL to target active vanity domain', function () {
         ->andReturn(['data' => []]);
 
     $service = new MigrationService($source, $target);
+    $slug = $service->execute($plan, fn () => null);
+
+    expect($slug)->toBe('myapp');
+});
+
+test('execute resolves template placeholders and manifest env_resolvers', function () {
+    $source = Mockery::mock(CloudApiClient::class);
+    $target = Mockery::mock(CloudApiClient::class);
+
+    $plan = makePlan(variables: [
+        'env-1' => [
+            ['key' => 'APP_KEY', 'value' => 'base64:xxx'],
+            ['key' => 'SERVICE_URL', 'value' => '{{apps.dracin-api.envs.main.url}}/endpoint'],
+        ],
+    ]);
+
+    $manifest = MigrationManifest::fromArray([
+        'env_resolvers' => [
+            'myapp' => [
+                'MANIFEST_EXTRA_VAR' => '{{apps.dracin-api.envs.main.vanity_domain}}',
+            ],
+        ],
+    ]);
+
+    $target->shouldReceive('post')
+        ->with('applications', Mockery::any())
+        ->andReturn(['data' => makeApp('app-new', 'myapp', 'myapp')]);
+
+    $target->shouldReceive('post')
+        ->with('applications/app-new/environments', Mockery::any())
+        ->andReturn(['data' => makeEnv('env-new', 'production')]);
+
+    $source->shouldReceive('getAll')->andReturn([]);
+    $target->shouldReceive('getAll')->with('applications/app-new/environments')->andReturn([]);
+    $target->shouldReceive('getAll')->with('databases/clusters')->andReturn([]);
+    $target->shouldReceive('getAll')->with('caches')->andReturn([]);
+    $target->shouldReceive('getAll')->with('environments/env-new/instances')->andReturn([]);
+    $target->shouldReceive('patch')->andReturn(['data' => makeEnv('env-new')]);
+
+    $target->shouldReceive('getAll')
+        ->with('applications')
+        ->andReturn([
+            [
+                'id' => 'app-target-api',
+                'attributes' => [
+                    'name' => 'dracin-api',
+                    'slug' => 'dracin-api',
+                ],
+            ],
+        ]);
+
+    $target->shouldReceive('getAll')
+        ->with('applications/app-target-api/environments')
+        ->andReturn([
+            [
+                'id' => 'env-target-main',
+                'attributes' => [
+                    'name' => 'main',
+                    'vanity_domain' => 'dracin-api-main-xyz.laravel.cloud',
+                ],
+            ],
+        ]);
+
+    $target->shouldReceive('post')
+        ->with('environments/env-new/variables', [
+            'method' => 'set',
+            'variables' => [
+                ['key' => 'APP_KEY', 'value' => 'base64:xxx'],
+                ['key' => 'SERVICE_URL', 'value' => 'https://dracin-api-main-xyz.laravel.cloud/endpoint'],
+                ['key' => 'MANIFEST_EXTRA_VAR', 'value' => 'dracin-api-main-xyz.laravel.cloud'],
+            ],
+        ])
+        ->once()
+        ->andReturn(['data' => []]);
+
+    $service = new MigrationService($source, $target, manifest: $manifest);
     $slug = $service->execute($plan, fn () => null);
 
     expect($slug)->toBe('myapp');

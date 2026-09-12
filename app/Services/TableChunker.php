@@ -2,6 +2,8 @@
 
 namespace App\Services;
 
+use App\Data\TablePolicy;
+
 class TableChunker
 {
     public const DEFAULT_ROW_THRESHOLD = 100_000;
@@ -210,7 +212,8 @@ class TableChunker
         string $dbName,
         array $ignoreTables = [],
         int $sizeThreshold = self::DEFAULT_SIZE_THRESHOLD,
-        int $rowThreshold = self::DEFAULT_ROW_THRESHOLD
+        int $rowThreshold = self::DEFAULT_ROW_THRESHOLD,
+        array $tablePolicies = []
     ): array {
         $ignoreClause = '';
         if ($ignoreTables) {
@@ -238,8 +241,30 @@ class TableChunker
                 continue;
             }
 
+            $policyObj = $tablePolicies[$table] ?? null;
+            $forceChunk = false;
+            $tableSizeThreshold = $sizeThreshold;
+            $tableRowThreshold = $rowThreshold;
+
+            if ($policyObj instanceof TablePolicy) {
+                if ($policyObj->isIgnore() || $policyObj->isSchemaOnly() || ($policyObj->isTransient() && ! $policyObj->migrateData)) {
+                    continue;
+                }
+                if ($policyObj->isChunked()) {
+                    $forceChunk = true;
+                }
+                if ($policyObj->thresholdBytes) {
+                    $tableSizeThreshold = $policyObj->thresholdBytes;
+                }
+                if ($policyObj->thresholdRows) {
+                    $tableRowThreshold = $policyObj->thresholdRows;
+                }
+            } elseif (is_string($policyObj) && $policyObj === 'chunked') {
+                $forceChunk = true;
+            }
+
             $totalBytes = $dataLength + $indexLength;
-            $shouldChunk = $this->shouldChunk($dataLength, $tableRows, $sizeThreshold, $rowThreshold);
+            $shouldChunk = $forceChunk || $this->shouldChunk($dataLength, $tableRows, $tableSizeThreshold, $tableRowThreshold);
 
             $strategy = 'none';
             $pkCol = null;
@@ -346,7 +371,8 @@ class TableChunker
         int $concurrency = 4,
         int $chunkSize = self::DEFAULT_CHUNK_SIZE,
         int $sizeThreshold = self::DEFAULT_SIZE_THRESHOLD,
-        int $rowThreshold = self::DEFAULT_ROW_THRESHOLD
+        int $rowThreshold = self::DEFAULT_ROW_THRESHOLD,
+        array $tablePolicies = []
     ): array {
         $ignoreClause = '';
         if ($ignoreTables) {
@@ -374,6 +400,38 @@ class TableChunker
                 continue;
             }
 
+            // Check table policies from manifest
+            $policyObj = $tablePolicies[$table] ?? null;
+            $tableChunkSize = $chunkSize;
+            $tableSizeThreshold = $sizeThreshold;
+            $tableRowThreshold = $rowThreshold;
+            $forceChunk = false;
+
+            if ($policyObj instanceof TablePolicy) {
+                if (! $policyObj->shouldMigrateData()) {
+                    continue; // Skip data migration for ignore, schema_only, or non-data transient
+                }
+                if ($policyObj->isChunked()) {
+                    $forceChunk = true;
+                }
+                if ($policyObj->chunkSize) {
+                    $tableChunkSize = $policyObj->chunkSize;
+                }
+                if ($policyObj->thresholdBytes) {
+                    $tableSizeThreshold = $policyObj->thresholdBytes;
+                }
+                if ($policyObj->thresholdRows) {
+                    $tableRowThreshold = $policyObj->thresholdRows;
+                }
+            } elseif (is_string($policyObj)) {
+                if (in_array($policyObj, ['ignore', 'schema_only', 'transient'], true)) {
+                    continue;
+                }
+                if ($policyObj === 'chunked') {
+                    $forceChunk = true;
+                }
+            }
+
             $totalBytes = $dataLength + $indexLength;
             $tablePartitions = $this->partitionTable(
                 $mysqlBin,
@@ -382,10 +440,10 @@ class TableChunker
                 $table,
                 $totalBytes,
                 $tableRows,
-                $chunkSize,
+                $tableChunkSize,
                 $concurrency,
-                $sizeThreshold,
-                $rowThreshold
+                $forceChunk ? 0 : $tableSizeThreshold,
+                $forceChunk ? 0 : $tableRowThreshold
             );
 
             foreach ($tablePartitions as $partition) {

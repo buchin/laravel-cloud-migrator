@@ -3,10 +3,12 @@
 namespace App\Commands;
 
 use App\Services\CloudApiClient;
+use App\Services\MigrationManifest;
 use LaravelZero\Framework\Commands\Command;
 use RuntimeException;
 
 use function Laravel\Prompts\error;
+use function Laravel\Prompts\info;
 use function Laravel\Prompts\password;
 use function Laravel\Prompts\spin;
 
@@ -18,6 +20,7 @@ class VerifyDbCommand extends Command
                             {--schema=* : Only verify specific schemas (default: all)}
                             {--skip-schema=* : Skip these schemas}
                             {--ignore-table=* : Exclude tables from mismatch checks, format: schema.table or table}
+                            {--manifest= : Path to declarative migration manifest file (default: migration-plan.json if exists)}
                             {--only-mismatches : Only show tables with problems (hide green/gray rows)}';
 
     protected $description = 'Verify migrated database contents with exact COUNT(*) per table';
@@ -48,6 +51,21 @@ class VerifyDbCommand extends Command
             placeholder: 'Paste your token here...',
             required: true,
         );
+
+        $manifestPath = $this->option('manifest');
+        $manifest = null;
+        if ($manifestPath) {
+            if (! file_exists($manifestPath)) {
+                error("Specified manifest file does not exist: {$manifestPath}");
+
+                return self::FAILURE;
+            }
+            $manifest = MigrationManifest::fromFile($manifestPath);
+            info("Loaded verification manifest from {$manifestPath}");
+        } elseif (file_exists('migration-plan.json')) {
+            $manifest = MigrationManifest::fromFile('migration-plan.json');
+            info('Loaded declarative verification manifest from migration-plan.json');
+        }
 
         $source = new CloudApiClient($sourceToken);
         $target = new CloudApiClient($targetToken);
@@ -155,6 +173,15 @@ class VerifyDbCommand extends Command
                 }
 
                 if (! $inTgt) {
+                    if ($this->isIgnored($tgtSchema, $table, $ignoreTables, $manifest, $clusterName)) {
+                        if (! $onlyMismatches) {
+                            $srcCount = number_format((int) $this->count($mysql, $srcConn, $srcSchema, $table));
+                            $this->row('gray', '·', $table, $srcCount, '—', 'ignored (policy)');
+                        }
+
+                        continue;
+                    }
+
                     $srcCount = number_format((int) $this->count($mysql, $srcConn, $srcSchema, $table));
                     $this->row('red', '✗', $table, $srcCount, '—', 'missing in target');
                     $allGood = $schemaGood = false;
@@ -165,7 +192,7 @@ class VerifyDbCommand extends Command
                 $src = (int) $this->count($mysql, $srcConn, $srcSchema, $table);
                 $tgt = (int) $this->count($mysql, $tgtConn, $tgtSchema, $table);
 
-                if ($this->isTransient($table)) {
+                if ($this->isTransient($table, $manifest, $tgtSchema, $clusterName)) {
                     // Transient tables (queues, caches, sessions) are expected to diverge.
                     if (! $onlyMismatches) {
                         $this->row('gray', '·', $table, number_format($src), number_format($tgt), 'transient (ok)');
@@ -174,7 +201,16 @@ class VerifyDbCommand extends Command
                     continue;
                 }
 
-                if ($this->isIgnored($tgtSchema, $table, $ignoreTables)) {
+                if ($this->isSchemaOnly($tgtSchema, $table, $manifest, $clusterName)) {
+                    // Schema-only tables are expected to have schema created without data rows.
+                    if (! $onlyMismatches) {
+                        $this->row('gray', '·', $table, number_format($src), number_format($tgt), 'schema_only (ok)');
+                    }
+
+                    continue;
+                }
+
+                if ($this->isIgnored($tgtSchema, $table, $ignoreTables, $manifest, $clusterName)) {
                     // Policy-skipped tables (links, nerd_urls, episodes) are expected to have data skipped.
                     if (! $onlyMismatches) {
                         $this->row('gray', '·', $table, number_format($src), number_format($tgt), 'skipped (policy)');
@@ -286,17 +322,29 @@ class VerifyDbCommand extends Command
     }
 
     /** Tables whose contents are ephemeral and expected not to match after migration. */
-    private function isTransient(string $table): bool
+    private function isTransient(string $table, ?MigrationManifest $manifest = null, ?string $schema = null, ?string $cluster = null): bool
     {
+        if ($manifest && $schema && $manifest->isTransient($table, $schema, $cluster)) {
+            return true;
+        }
+
         $transient = ['jobs', 'cache', 'cache_locks', 'sessions', 'job_batches'];
 
         return in_array($table, $transient, true);
     }
 
     /** Tables whose contents are deliberately skipped per migration policy or --ignore-table. */
-    private function isIgnored(string $schema, string $table, array $ignoreTables = []): bool
+    private function isIgnored(string $schema, string $table, array $ignoreTables = [], ?MigrationManifest $manifest = null, ?string $cluster = null): bool
     {
+        if ($manifest && $manifest->isIgnored($table, $schema, $cluster)) {
+            return true;
+        }
+
         if (in_array($table, $ignoreTables, true) || in_array("{$schema}.{$table}", $ignoreTables, true)) {
+            return true;
+        }
+
+        if ($cluster && in_array("{$cluster}.{$table}", $ignoreTables, true)) {
             return true;
         }
 
@@ -307,6 +355,16 @@ class VerifyDbCommand extends Command
         ];
 
         return in_array("{$schema}.{$table}", $policySkipped, true);
+    }
+
+    /** Tables whose schema is migrated without data rows. */
+    private function isSchemaOnly(string $schema, string $table, ?MigrationManifest $manifest = null, ?string $cluster = null): bool
+    {
+        if ($manifest && $manifest->isSchemaOnly($table, $schema, $cluster)) {
+            return true;
+        }
+
+        return false;
     }
 
     /** @return array{string, string, string} [icon, color, label] */

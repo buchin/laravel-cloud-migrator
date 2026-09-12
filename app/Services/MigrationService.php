@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Data\ApplicationData;
 use App\Data\EnvironmentData;
 use App\Data\MigrationPlan;
+use App\Data\TablePolicy;
 
 class MigrationService
 {
@@ -64,12 +65,20 @@ class MigrationService
 
     private TableChunker $tableChunker;
 
+    private CrossAppEnvResolver $envResolver;
+
+    private ?MigrationManifest $manifest = null;
+
     public function __construct(
         private readonly CloudApiClient $source,
         private readonly CloudApiClient $target,
         ?TableChunker $tableChunker = null,
+        ?CrossAppEnvResolver $envResolver = null,
+        ?MigrationManifest $manifest = null,
     ) {
         $this->tableChunker = $tableChunker ?? new TableChunker;
+        $this->envResolver = $envResolver ?? new CrossAppEnvResolver($this->target);
+        $this->manifest = $manifest;
     }
 
     public function getTableChunker(): TableChunker
@@ -80,6 +89,26 @@ class MigrationService
     public function setTableChunker(TableChunker $tableChunker): void
     {
         $this->tableChunker = $tableChunker;
+    }
+
+    public function getEnvResolver(): CrossAppEnvResolver
+    {
+        return $this->envResolver;
+    }
+
+    public function setEnvResolver(CrossAppEnvResolver $envResolver): void
+    {
+        $this->envResolver = $envResolver;
+    }
+
+    public function getManifest(): ?MigrationManifest
+    {
+        return $this->manifest;
+    }
+
+    public function setManifest(?MigrationManifest $manifest): void
+    {
+        $this->manifest = $manifest;
     }
 
     public function getAntiDeadlockSqlPrefix(): string
@@ -536,9 +565,34 @@ class MigrationService
             if ($vars) {
                 $count = count($vars);
                 $progress("  Migrating {$count} environment variable(s)...");
-                $formatted = array_map(function ($v) {
+
+                $appSlug = $plan->application->slug;
+                $appName = $plan->application->name;
+                $manifestResolvers = $this->manifest?->getEnvResolvers($appSlug)
+                    ?? $this->manifest?->getEnvResolvers($appName)
+                    ?? [];
+
+                $context = [
+                    'app' => $appSlug,
+                    'appName' => $appName,
+                    'env' => $env->name,
+                    'envSlug' => $env->slug,
+                ];
+
+                $processedKeys = [];
+
+                $formatted = array_map(function ($v) use ($manifestResolvers, $context, &$processedKeys) {
+                    $key = $v['key'];
                     $val = $v['value'];
-                    if ($v['key'] === 'API_BASE_URL' && str_contains($val, 'dracin-api.laravel.cloud')) {
+                    $processedKeys[] = $key;
+
+                    if (isset($manifestResolvers[$key])) {
+                        $val = $manifestResolvers[$key];
+                    }
+
+                    $val = $this->envResolver->resolve($val, $context);
+
+                    if ($key === 'API_BASE_URL' && str_contains($val, 'dracin-api.laravel.cloud')) {
                         $targetVanity = $this->resolveTargetVanityDomain('dracin-api.laravel.cloud');
                         if ($targetVanity) {
                             $val = str_replace('dracin-api.laravel.cloud', $targetVanity, $val);
@@ -546,11 +600,21 @@ class MigrationService
                     }
 
                     return array_filter([
-                        'key' => $v['key'],
+                        'key' => $key,
                         'value' => $val,
                         'is_secret' => $v['is_secret'] ?? null,
                     ], fn ($val) => $val !== null);
                 }, $vars);
+
+                foreach ($manifestResolvers as $mKey => $mTemplate) {
+                    if (! in_array($mKey, $processedKeys, true)) {
+                        $val = $this->envResolver->resolve($mTemplate, $context);
+                        $formatted[] = [
+                            'key' => $mKey,
+                            'value' => $val,
+                        ];
+                    }
+                }
 
                 $this->target->post("environments/{$newEnvId}/variables", [
                     'method' => 'set',
@@ -764,6 +828,13 @@ class MigrationService
 
     public function resolveTargetVanityDomain(string $sourceHost): ?string
     {
+        if (isset($this->envResolver)) {
+            $resolved = $this->envResolver->resolveVanityDomain($sourceHost);
+            if ($resolved) {
+                return $resolved;
+            }
+        }
+
         if (preg_match('/^([a-z0-9-]+)\.laravel\.cloud$/', $sourceHost, $m)) {
             $appName = $m[1];
             try {
@@ -1080,7 +1151,7 @@ class MigrationService
         return null;
     }
 
-    public function runDatabaseMigration(array $srcConn, string $srcDb, array $tgtConn, string $tgtDb, string $dbType, callable $progress, array $ignoreTables = [], int $concurrency = 4, int $chunkSize = TableChunker::DEFAULT_CHUNK_SIZE): void
+    public function runDatabaseMigration(array $srcConn, string $srcDb, array $tgtConn, string $tgtDb, string $dbType, callable $progress, array $ignoreTables = [], int $concurrency = 4, int $chunkSize = TableChunker::DEFAULT_CHUNK_SIZE, array $tablePolicies = []): void
     {
         $isPostgres = str_contains($dbType, 'pgsql') || str_contains($dbType, 'postgres');
 
@@ -1099,7 +1170,7 @@ class MigrationService
                 throw new \RuntimeException('mysqldump/mysql not found — install MySQL client tools and retry.');
             }
 
-            $this->runMysqlMigration($dumpBin, $importBin, $srcConn, $srcDb, $tgtConn, $tgtDb, $progress, $ignoreTables, $concurrency, $chunkSize);
+            $this->runMysqlMigration($dumpBin, $importBin, $srcConn, $srcDb, $tgtConn, $tgtDb, $progress, $ignoreTables, $concurrency, $chunkSize, $tablePolicies);
         }
     }
 
@@ -1373,6 +1444,7 @@ class MigrationService
         array $ignoreTables = [],
         int $concurrency = 4,
         int $chunkSize = TableChunker::DEFAULT_CHUNK_SIZE,
+        array $tablePolicies = [],
     ): void {
         $tmpDir = sys_get_temp_dir().'/cloud_migrator_'.uniqid();
         mkdir($tmpDir, 0700, true);
@@ -1388,6 +1460,15 @@ class MigrationService
             $schemaFile = $tmpDir.'/schema.sql';
             $schemaErrFile = $tmpDir.'/schema.err';
 
+            // Collect any tables with policy 'ignore' to skip from schema dump
+            $schemaIgnoreTables = $ignoreTables;
+            foreach ($tablePolicies as $tbl => $pol) {
+                if (($pol instanceof TablePolicy && $pol->isIgnore()) || $pol === 'ignore') {
+                    $schemaIgnoreTables[] = $tbl;
+                }
+            }
+            $schemaIgnoreTables = array_unique($schemaIgnoreTables);
+
             $schemaDumpCmd = $this->buildMysqldumpCommand(
                 $dumpBin,
                 $srcConn,
@@ -1395,6 +1476,14 @@ class MigrationService
                 schemaOnly: true,
                 optFile: $optFile
             );
+
+            if (! empty($schemaIgnoreTables)) {
+                $ignoreArgs = [];
+                foreach ($schemaIgnoreTables as $ign) {
+                    $ignoreArgs[] = '--ignore-table='.escapeshellarg("{$srcDb}.{$ign}");
+                }
+                $schemaDumpCmd .= ' '.implode(' ', $ignoreArgs);
+            }
 
             $proc = proc_open($schemaDumpCmd, [
                 0 => ['file', '/dev/null', 'r'],
@@ -1452,7 +1541,7 @@ class MigrationService
             }
 
             // ── Phase 2: parallel per-table data dumps ───────────────────────
-            $tables = $this->getSourceTables($srcConn, $srcDb, $ignoreTables, $concurrency, $chunkSize);
+            $tables = $this->getSourceTables($srcConn, $srcDb, $ignoreTables, $concurrency, $chunkSize, $tablePolicies);
             $total = count($tables);
 
             if ($ignoreTables) {
@@ -1588,7 +1677,8 @@ class MigrationService
         string $dbName,
         array $ignoreTables = [],
         int $concurrency = 4,
-        int $chunkSize = TableChunker::DEFAULT_CHUNK_SIZE
+        int $chunkSize = TableChunker::DEFAULT_CHUNK_SIZE,
+        array $tablePolicies = []
     ): array {
         $mysql = $this->findBinary('mysql');
         if (! $mysql) {
@@ -1601,7 +1691,8 @@ class MigrationService
             $dbName,
             $ignoreTables,
             $concurrency,
-            $chunkSize
+            $chunkSize,
+            tablePolicies: $tablePolicies
         );
     }
 
