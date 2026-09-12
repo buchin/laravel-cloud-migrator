@@ -17,6 +17,7 @@ class VerifyDbCommand extends Command
                             {--target-token= : API token for the target organization}
                             {--schema=* : Only verify specific schemas (default: all)}
                             {--skip-schema=* : Skip these schemas}
+                            {--ignore-table=* : Exclude tables from mismatch checks, format: schema.table or table}
                             {--only-mismatches : Only show tables with problems (hide green/gray rows)}';
 
     protected $description = 'Verify migrated database contents with exact COUNT(*) per table';
@@ -76,6 +77,7 @@ class VerifyDbCommand extends Command
 
         $filterSchemas = (array) $this->option('schema');
         $skipSchemas = (array) $this->option('skip-schema');
+        $ignoreTables = (array) $this->option('ignore-table');
 
         $pairsToCheck = [];
         foreach ($tgtSchemas as $tgtKey => $tgtInfo) {
@@ -167,6 +169,15 @@ class VerifyDbCommand extends Command
                     // Transient tables (queues, caches, sessions) are expected to diverge.
                     if (! $onlyMismatches) {
                         $this->row('gray', '·', $table, number_format($src), number_format($tgt), 'transient (ok)');
+                    }
+
+                    continue;
+                }
+
+                if ($this->isIgnored($tgtSchema, $table, $ignoreTables)) {
+                    // Policy-skipped tables (links, nerd_urls, episodes) are expected to have data skipped.
+                    if (! $onlyMismatches) {
+                        $this->row('gray', '·', $table, number_format($src), number_format($tgt), 'skipped (policy)');
                     }
 
                     continue;
@@ -280,6 +291,22 @@ class VerifyDbCommand extends Command
         $transient = ['jobs', 'cache', 'cache_locks', 'sessions', 'job_batches'];
 
         return in_array($table, $transient, true);
+    }
+
+    /** Tables whose contents are deliberately skipped per migration policy or --ignore-table. */
+    private function isIgnored(string $schema, string $table, array $ignoreTables = []): bool
+    {
+        if (in_array($table, $ignoreTables, true) || in_array("{$schema}.{$table}", $ignoreTables, true)) {
+            return true;
+        }
+
+        $policySkipped = [
+            'nerd.links',
+            'dojo.nerd_urls',
+            'main.episodes',
+        ];
+
+        return in_array("{$schema}.{$table}", $policySkipped, true);
     }
 
     /** @return array{string, string, string} [icon, color, label] */

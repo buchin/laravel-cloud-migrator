@@ -2,6 +2,7 @@
 
 use App\Commands\MigrateDbCommand;
 use App\Commands\StatusCommand;
+use App\Commands\VerifyDbCommand;
 use App\Services\CloudApiClient;
 
 function callPrivate(object $object, string $method, array $args = [])
@@ -111,7 +112,7 @@ test('VerifyDbCommand keeps same-named schemas in different clusters distinct', 
         ->with('databases/clusters/cluster-b/databases')
         ->andReturn([makeSchema('schema-b', 'main')]);
 
-    $command = new \App\Commands\VerifyDbCommand;
+    $command = new VerifyDbCommand;
 
     $map = callPrivate($command, 'fetchClusterSchemas', [$client]);
 
