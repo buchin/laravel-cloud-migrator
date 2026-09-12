@@ -73,6 +73,17 @@ class CloudApiClient
         }
     }
 
+    public function put(string $path, array $data = []): array
+    {
+        try {
+            $response = $this->http->put($path, ['json' => $data]);
+
+            return json_decode($response->getBody()->getContents(), true) ?? [];
+        } catch (ClientException $e) {
+            $this->throwApiError($e);
+        }
+    }
+
     public function delete(string $path): void
     {
         try {
@@ -87,6 +98,6 @@ class CloudApiClient
         $body = json_decode($e->getResponse()->getBody()->getContents(), true);
         $message = $body['message'] ?? $e->getMessage();
 
-        throw new RuntimeException("API Error [{$e->getResponse()->getStatusCode()}]: {$message}");
+        throw new RuntimeException("API Error [{$e->getResponse()->getStatusCode()}]: {$message}", $e->getResponse()->getStatusCode(), $e);
     }
 }

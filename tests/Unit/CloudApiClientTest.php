@@ -68,6 +68,24 @@ test('post returns decoded response', function () {
     expect($client->post('applications', ['name' => 'test']))->toBe(['data' => ['id' => 'app-123']]);
 });
 
+test('put returns decoded response', function () {
+    $client = makeClient([
+        new Response(200, [], json_encode(['data' => ['id' => 'env-123', 'attributes' => ['vanity_domain' => 'termapi.laravel.cloud']]])),
+    ]);
+
+    expect($client->put('environments/env-123/vanity-domain', ['name' => 'termapi']))
+        ->toBe(['data' => ['id' => 'env-123', 'attributes' => ['vanity_domain' => 'termapi.laravel.cloud']]]);
+});
+
+test('put throws RuntimeException on 4xx', function () {
+    $client = makeClient([
+        new Response(422, [], json_encode(['message' => 'This Laravel Cloud domain is already taken.'])),
+    ]);
+
+    expect(fn () => $client->put('environments/env-123/vanity-domain', ['name' => 'termapi']))
+        ->toThrow(RuntimeException::class, 'API Error [422]: This Laravel Cloud domain is already taken.');
+});
+
 test('delete does not throw on success', function () {
     $client = makeClient([new Response(204)]);
 
