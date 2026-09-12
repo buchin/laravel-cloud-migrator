@@ -59,7 +59,7 @@ class VerifyDbCommand extends Command
         }
 
         try {
-            [$srcConn, $srcSchemas] = spin(fn () => $this->fetchClusterInfo($source), 'Fetching source cluster...');
+            $srcSchemas = spin(fn () => $this->fetchClusterSchemas($source), 'Fetching source cluster...');
         } catch (RuntimeException $e) {
             error('Source: '.$e->getMessage());
 
@@ -67,7 +67,7 @@ class VerifyDbCommand extends Command
         }
 
         try {
-            [$tgtConn, $tgtSchemas] = spin(fn () => $this->fetchClusterInfo($target), 'Fetching target cluster...');
+            $tgtSchemas = spin(fn () => $this->fetchClusterSchemas($target), 'Fetching target cluster...');
         } catch (RuntimeException $e) {
             error('Target: '.$e->getMessage());
 
@@ -77,15 +77,39 @@ class VerifyDbCommand extends Command
         $filterSchemas = (array) $this->option('schema');
         $skipSchemas = (array) $this->option('skip-schema');
 
-        // Determine which schemas to verify
-        $schemasToCheck = array_intersect($srcSchemas, $tgtSchemas);
+        $pairsToCheck = [];
+        foreach ($tgtSchemas as $tgtKey => $tgtInfo) {
+            if (isset($srcSchemas[$tgtKey])) {
+                $pairsToCheck[$tgtKey] = [
+                    'src' => $srcSchemas[$tgtKey],
+                    'tgt' => $tgtInfo,
+                ];
+            } else {
+                $matching = array_filter($srcSchemas, fn ($s) => $s['schema'] === $tgtInfo['schema']);
+                if (count($matching) === 1) {
+                    $pairsToCheck[$tgtKey] = [
+                        'src' => reset($matching),
+                        'tgt' => $tgtInfo,
+                    ];
+                }
+            }
+        }
 
         if (! empty($filterSchemas)) {
-            $schemasToCheck = array_intersect($schemasToCheck, $filterSchemas);
+            $pairsToCheck = array_filter($pairsToCheck, function ($pair, $key) use ($filterSchemas) {
+                return in_array($key, $filterSchemas, true)
+                    || in_array($pair['tgt']['schema'], $filterSchemas, true);
+            }, ARRAY_FILTER_USE_BOTH);
         }
-        $schemasToCheck = array_diff($schemasToCheck, $skipSchemas);
 
-        if (empty($schemasToCheck)) {
+        if (! empty($skipSchemas)) {
+            $pairsToCheck = array_filter($pairsToCheck, function ($pair, $key) use ($skipSchemas) {
+                return ! in_array($key, $skipSchemas, true)
+                    && ! in_array($pair['tgt']['schema'], $skipSchemas, true);
+            }, ARRAY_FILTER_USE_BOTH);
+        }
+
+        if (empty($pairsToCheck)) {
             error('No schemas to verify (check --schema / --skip-schema options).');
 
             return self::FAILURE;
@@ -94,12 +118,18 @@ class VerifyDbCommand extends Command
         $allGood = true;
         $onlyMismatches = (bool) $this->option('only-mismatches');
 
-        foreach ($schemasToCheck as $schema) {
-            $this->newLine();
-            $this->line("<fg=cyan;options=bold>── {$schema} ──</>");
+        foreach ($pairsToCheck as $pairKey => $pair) {
+            $srcConn = $pair['src']['connection'];
+            $srcSchema = $pair['src']['schema'];
+            $tgtConn = $pair['tgt']['connection'];
+            $tgtSchema = $pair['tgt']['schema'];
+            $clusterName = $pair['tgt']['cluster'];
 
-            $srcTables = $this->getTables($mysql, $srcConn, $schema);
-            $tgtTables = $this->getTables($mysql, $tgtConn, $schema);
+            $this->newLine();
+            $this->line("<fg=cyan;options=bold>── {$clusterName}.{$tgtSchema} ──</>");
+
+            $srcTables = $this->getTables($mysql, $srcConn, $srcSchema);
+            $tgtTables = $this->getTables($mysql, $tgtConn, $tgtSchema);
 
             $allTables = array_unique(array_merge($srcTables, $tgtTables));
             sort($allTables);
@@ -114,7 +144,7 @@ class VerifyDbCommand extends Command
                 $inTgt = in_array($table, $tgtTables);
 
                 if (! $inSrc) {
-                    $tgtCount = number_format((int) $this->count($mysql, $tgtConn, $schema, $table));
+                    $tgtCount = number_format((int) $this->count($mysql, $tgtConn, $tgtSchema, $table));
                     if (! $onlyMismatches) {
                         $this->row('yellow', '⚠', $table, '—', $tgtCount, 'only in target');
                     }
@@ -123,15 +153,15 @@ class VerifyDbCommand extends Command
                 }
 
                 if (! $inTgt) {
-                    $srcCount = number_format((int) $this->count($mysql, $srcConn, $schema, $table));
+                    $srcCount = number_format((int) $this->count($mysql, $srcConn, $srcSchema, $table));
                     $this->row('red', '✗', $table, $srcCount, '—', 'missing in target');
                     $allGood = $schemaGood = false;
 
                     continue;
                 }
 
-                $src = (int) $this->count($mysql, $srcConn, $schema, $table);
-                $tgt = (int) $this->count($mysql, $tgtConn, $schema, $table);
+                $src = (int) $this->count($mysql, $srcConn, $srcSchema, $table);
+                $tgt = (int) $this->count($mysql, $tgtConn, $tgtSchema, $table);
 
                 if ($this->isTransient($table)) {
                     // Transient tables (queues, caches, sessions) are expected to diverge.
@@ -155,9 +185,9 @@ class VerifyDbCommand extends Command
 
             $this->newLine();
             if ($schemaGood) {
-                $this->line("  <fg=green>✓ {$schema} — all tables match.</>");
+                $this->line("  <fg=green>✓ {$clusterName}.{$tgtSchema} — all tables match.</>");
             } else {
-                $this->line("  <fg=yellow>⚠ {$schema} — some tables need attention.</>");
+                $this->line("  <fg=yellow>⚠ {$clusterName}.{$tgtSchema} — some tables need attention.</>");
             }
         }
 
@@ -176,8 +206,8 @@ class VerifyDbCommand extends Command
         return $allGood ? self::SUCCESS : self::FAILURE;
     }
 
-    /** Returns [connection, schemaNames[]] for the first cluster in the org. */
-    private function fetchClusterInfo(CloudApiClient $client): array
+    /** Returns array<string, array{cluster: string, schema: string, connection: array, type: string}> */
+    private function fetchClusterSchemas(CloudApiClient $client): array
     {
         $clusters = $client->getAll('databases/clusters');
 
@@ -185,28 +215,35 @@ class VerifyDbCommand extends Command
             throw new RuntimeException('No database clusters found in organization.');
         }
 
-        // Collect all schemas across all clusters
-        $conn = null;
-        $schemas = [];
+        $map = [];
 
         foreach ($clusters as $cluster) {
             $clusterConn = $cluster['attributes']['connection'] ?? null;
+            $clusterName = $cluster['attributes']['name'] ?? $cluster['id'];
+            $clusterType = $cluster['attributes']['type'] ?? 'mysql';
+
             if (! $clusterConn) {
                 continue;
             }
-            $conn = $clusterConn;
 
             $dbList = $client->getAll("databases/clusters/{$cluster['id']}/databases");
             foreach ($dbList as $db) {
-                $schemas[] = $db['attributes']['name'];
+                $schemaName = $db['attributes']['name'];
+                $key = "{$clusterName}.{$schemaName}";
+                $map[$key] = [
+                    'cluster' => $clusterName,
+                    'schema' => $schemaName,
+                    'connection' => $clusterConn,
+                    'type' => $clusterType,
+                ];
             }
         }
 
-        if (! $conn) {
+        if (empty($map)) {
             throw new RuntimeException('No cluster connection available.');
         }
 
-        return [$conn, $schemas];
+        return $map;
     }
 
     private function getTables(string $mysql, array $conn, string $schema): array

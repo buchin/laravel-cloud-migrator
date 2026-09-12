@@ -92,3 +92,32 @@ test('StatusCommand keeps same-named schemas in different clusters distinct', fu
         ->and($map['app-one.main']['hostname'])->toBe('cluster-a.example.com')
         ->and($map['app-two.main']['hostname'])->toBe('cluster-b.example.com');
 });
+
+test('VerifyDbCommand keeps same-named schemas in different clusters distinct', function () {
+    $client = Mockery::mock(CloudApiClient::class);
+
+    $client->shouldReceive('getAll')
+        ->with('databases/clusters')
+        ->andReturn([
+            makeCluster('cluster-a', 'app-one'),
+            makeCluster('cluster-b', 'app-two'),
+        ]);
+
+    $client->shouldReceive('getAll')
+        ->with('databases/clusters/cluster-a/databases')
+        ->andReturn([makeSchema('schema-a', 'main')]);
+
+    $client->shouldReceive('getAll')
+        ->with('databases/clusters/cluster-b/databases')
+        ->andReturn([makeSchema('schema-b', 'main')]);
+
+    $command = new \App\Commands\VerifyDbCommand;
+
+    $map = callPrivate($command, 'fetchClusterSchemas', [$client]);
+
+    expect($map)->toHaveCount(2)
+        ->and($map)->toHaveKey('app-one.main')
+        ->and($map)->toHaveKey('app-two.main')
+        ->and($map['app-one.main']['connection']['hostname'])->toBe('cluster-a.example.com')
+        ->and($map['app-two.main']['connection']['hostname'])->toBe('cluster-b.example.com');
+});
