@@ -1,0 +1,98 @@
+{
+  "$schema": "./docs/schemas/migration-plan.schema.json",
+  "version": "1.0",
+  "name": "Production Migration Plan Example",
+  "description": "Declarative migration manifest demonstrating per-database table policies (schema_only, chunked, ignore, transient) and cross-app environment variable template resolvers.",
+  "databases": {
+    "dojo.main": {
+      "default_policy": "full",
+      "tables": {
+        "telescope_entries": {
+          "policy": "schema_only",
+          "description": "Telemetry and query log entries; create table schema only without copying heavy data rows"
+        },
+        "telescope_entries_tags": {
+          "policy": "schema_only",
+          "description": "Telemetry entry tags; schema only"
+        },
+        "telescope_monitoring": {
+          "policy": "schema_only",
+          "description": "Telemetry monitoring records; schema only"
+        },
+        "sessions": {
+          "policy": "transient",
+          "description": "User sessions; ephemeral cache data not transferred, expected to diverge in parity checks"
+        },
+        "cache": {
+          "policy": "transient",
+          "description": "Application cache store; transient"
+        },
+        "cache_locks": {
+          "policy": "transient",
+          "description": "Atomic cache locks; transient"
+        },
+        "jobs": {
+          "policy": "transient",
+          "description": "Active queue jobs; transient"
+        },
+        "job_batches": {
+          "policy": "transient",
+          "description": "Queue job batches; transient"
+        },
+        "failed_jobs": {
+          "policy": "chunked",
+          "chunk_size": 25000,
+          "description": "Audit queue failures migrated with custom 25k chunk size"
+        },
+        "activity_logs": {
+          "policy": "chunked",
+          "chunk_size": 25000,
+          "threshold_rows": 50000,
+          "description": "Audit log partitioned in safe 25,000 row chunks to avoid long lock contention"
+        },
+        "nerd_urls": {
+          "policy": "ignore",
+          "description": "Legacy table completely excluded from schema dump and data migration"
+        }
+      }
+    },
+    "dracin_api.main": {
+      "default_policy": "full",
+      "tables": {
+        "episodes": {
+          "policy": "chunked",
+          "chunk_size": 10000,
+          "description": "Video episode metadata partitioned in 10k chunks"
+        },
+        "video_transcodes": {
+          "policy": "transient",
+          "description": "Temporary transcoding job records"
+        },
+        "legacy_drafts": {
+          "policy": "ignore",
+          "description": "Deprecated drafts excluded from target environment"
+        }
+      }
+    },
+    "nerd": {
+      "tables": {
+        "links": {
+          "policy": "ignore",
+          "description": "Excluded per Sprint 01 policy"
+        }
+      }
+    }
+  },
+  "env_resolvers": {
+    "dracin": {
+      "API_BASE_URL": "{{apps.dracin-api.envs.main.url}}/api",
+      "TARGET_VANITY_DOMAIN": "{{apps.dracin-api.envs.main.vanity_domain}}"
+    },
+    "stats": {
+      "DOJO_API_URL": "{{apps.dojo.envs.production.url}}"
+    },
+    "nerd": {
+      "INTERNAL_API_URL": "{{apps.termapi.envs.production.url}}"
+    }
+  }
+}
