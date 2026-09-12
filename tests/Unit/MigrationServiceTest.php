@@ -40,7 +40,7 @@ function makeEnv(string $id = 'env-1', string $name = 'production'): array
     ];
 }
 
-function makePlan(string $appId = 'app-1', string $appSlug = 'myapp'): MigrationPlan
+function makePlan(string $appId = 'app-1', string $appSlug = 'myapp', array $variables = []): MigrationPlan
 {
     return new MigrationPlan(
         application: new ApplicationData(
@@ -68,7 +68,7 @@ function makePlan(string $appId = 'app-1', string $appSlug = 'myapp'): Migration
                 instances: [],
             ),
         ],
-        variables: [],
+        variables: $variables,
         databases: [],
         caches: [],
         instances: [],
@@ -167,4 +167,107 @@ test('useSharedRegistries shares cluster and cache state across apps', function 
     $actual = $ref->getValue($service);
 
     expect($actual)->toBe(['cluster-src-1' => 'cluster-tgt-1']);
+});
+
+test('resolveTargetVanityDomain finds vanity domain in target', function () {
+    $source = Mockery::mock(CloudApiClient::class);
+    $target = Mockery::mock(CloudApiClient::class);
+
+    $target->shouldReceive('getAll')
+        ->with('applications')
+        ->andReturn([
+            [
+                'id' => 'app-target-api',
+                'attributes' => [
+                    'name' => 'dracin-api',
+                    'slug' => 'dracin-api',
+                ],
+            ],
+        ]);
+
+    $target->shouldReceive('getAll')
+        ->with('applications/app-target-api/environments')
+        ->andReturn([
+            [
+                'id' => 'env-target-main',
+                'attributes' => [
+                    'name' => 'main',
+                    'vanity_domain' => 'dracin-api-main-uatz4m.laravel.cloud',
+                ],
+            ],
+        ]);
+
+    $service = new MigrationService($source, $target);
+    $resolved = $service->resolveTargetVanityDomain('dracin-api.laravel.cloud');
+
+    expect($resolved)->toBe('dracin-api-main-uatz4m.laravel.cloud');
+});
+
+test('execute remaps API_BASE_URL to target active vanity domain', function () {
+    $source = Mockery::mock(CloudApiClient::class);
+    $target = Mockery::mock(CloudApiClient::class);
+
+    $plan = makePlan(variables: [
+        'env-1' => [
+            ['key' => 'APP_KEY', 'value' => 'base64:xxx'],
+            ['key' => 'API_BASE_URL', 'value' => 'https://dracin-api.laravel.cloud/api'],
+        ],
+    ]);
+
+    $target->shouldReceive('post')
+        ->with('applications', Mockery::any())
+        ->andReturn(['data' => makeApp('app-new', 'myapp', 'myapp')]);
+
+    $target->shouldReceive('post')
+        ->with('applications/app-new/environments', Mockery::any())
+        ->andReturn(['data' => makeEnv('env-new', 'production')]);
+
+    $source->shouldReceive('getAll')->andReturn([]);
+    $target->shouldReceive('getAll')->with('applications/app-new/environments')->andReturn([]);
+    $target->shouldReceive('getAll')->with('databases/clusters')->andReturn([]);
+    $target->shouldReceive('getAll')->with('caches')->andReturn([]);
+    $target->shouldReceive('getAll')->with('environments/env-new/instances')->andReturn([]);
+    $target->shouldReceive('patch')->andReturn(['data' => makeEnv('env-new')]);
+
+    // Target applications lookup for vanity resolution
+    $target->shouldReceive('getAll')
+        ->with('applications')
+        ->andReturn([
+            [
+                'id' => 'app-target-api',
+                'attributes' => [
+                    'name' => 'dracin-api',
+                    'slug' => 'dracin-api',
+                ],
+            ],
+        ]);
+
+    $target->shouldReceive('getAll')
+        ->with('applications/app-target-api/environments')
+        ->andReturn([
+            [
+                'id' => 'env-target-main',
+                'attributes' => [
+                    'name' => 'main',
+                    'vanity_domain' => 'dracin-api-main-uatz4m.laravel.cloud',
+                ],
+            ],
+        ]);
+
+    // Expect variables to be set with remapped API_BASE_URL
+    $target->shouldReceive('post')
+        ->with('environments/env-new/variables', [
+            'method' => 'set',
+            'variables' => [
+                ['key' => 'APP_KEY', 'value' => 'base64:xxx'],
+                ['key' => 'API_BASE_URL', 'value' => 'https://dracin-api-main-uatz4m.laravel.cloud/api'],
+            ],
+        ])
+        ->once()
+        ->andReturn(['data' => []]);
+
+    $service = new MigrationService($source, $target);
+    $slug = $service->execute($plan, fn () => null);
+
+    expect($slug)->toBe('myapp');
 });

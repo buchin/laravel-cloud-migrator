@@ -349,6 +349,8 @@ class MigrationService
             $existingEnvs[$e['attributes']['name']] = $e['id'];
         }
 
+        $planEnvNames = array_map(fn ($e) => $e->name, $plan->environments);
+
         foreach ($plan->environments as $env) {
             $progress("Creating environment: {$env->name}...");
 
@@ -356,18 +358,27 @@ class MigrationService
                 // Exact name match — reuse as-is.
                 $newEnvId = $existingEnvs[$env->name];
                 unset($existingEnvs[$env->name]);
-            } elseif (! empty($existingEnvs)) {
-                // No name match — rename the first auto-created env rather than
-                // creating a new one. Avoids orphaned envs that can't be deleted
-                // because the API prevents deleting the "production" environment.
-                $newEnvId = array_shift($existingEnvs);
-                $this->target->patch("environments/{$newEnvId}", ['name' => $env->name]);
             } else {
-                $newEnv = $this->target->post("applications/{$newAppId}/environments", [
-                    'name' => $env->name,
-                    'branch' => $env->branch ?? 'main',
-                ]);
-                $newEnvId = $newEnv['data']['id'];
+                // Find an auto-created env that is NOT needed by any upcoming plan environment
+                $reusableKey = null;
+                foreach ($existingEnvs as $candName => $candId) {
+                    if (! in_array($candName, $planEnvNames, true)) {
+                        $reusableKey = $candName;
+                        break;
+                    }
+                }
+
+                if ($reusableKey !== null) {
+                    $newEnvId = $existingEnvs[$reusableKey];
+                    unset($existingEnvs[$reusableKey]);
+                    $this->target->patch("environments/{$newEnvId}", ['name' => $env->name]);
+                } else {
+                    $newEnv = $this->target->post("applications/{$newAppId}/environments", [
+                        'name' => $env->name,
+                        'branch' => $env->branch ?? 'main',
+                    ]);
+                    $newEnvId = $newEnv['data']['id'];
+                }
             }
 
             $this->envIdMap[$env->id] = $newEnvId;
@@ -391,11 +402,21 @@ class MigrationService
             if ($vars) {
                 $count = count($vars);
                 $progress("  Migrating {$count} environment variable(s)...");
-                $formatted = array_map(fn ($v) => array_filter([
-                    'key' => $v['key'],
-                    'value' => $v['value'],
-                    'is_secret' => $v['is_secret'] ?? null,
-                ], fn ($val) => $val !== null), $vars);
+                $formatted = array_map(function ($v) {
+                    $val = $v['value'];
+                    if ($v['key'] === 'API_BASE_URL' && str_contains($val, 'dracin-api.laravel.cloud')) {
+                        $targetVanity = $this->resolveTargetVanityDomain('dracin-api.laravel.cloud');
+                        if ($targetVanity) {
+                            $val = str_replace('dracin-api.laravel.cloud', $targetVanity, $val);
+                        }
+                    }
+
+                    return array_filter([
+                        'key' => $v['key'],
+                        'value' => $val,
+                        'is_secret' => $v['is_secret'] ?? null,
+                    ], fn ($val) => $val !== null);
+                }, $vars);
 
                 $this->target->post("environments/{$newEnvId}/variables", [
                     'method' => 'set',
@@ -584,18 +605,52 @@ class MigrationService
                     // Already removed — proceed to add to target.
                 }
 
-                try {
-                    $this->target->post("environments/{$targetEnvId}/domains", [
-                        'name' => $domainName,
-                    ]);
-                    $progress("Moved domain: {$domainName} ({$env->name})");
-                } catch (\RuntimeException $e) {
-                    $progress("Failed to move {$domainName}: {$e->getMessage()}");
+                $moved = false;
+                for ($attempt = 1; $attempt <= 3; $attempt++) {
+                    try {
+                        $this->target->post("environments/{$targetEnvId}/domains", [
+                            'name' => $domainName,
+                        ]);
+                        $progress("Moved domain: {$domainName} ({$env->name})");
+                        $moved = true;
+                        break;
+                    } catch (\RuntimeException $e) {
+                        if ($attempt < 3) {
+                            sleep(2);
+                        } else {
+                            $progress("Failed to move {$domainName}: {$e->getMessage()}");
+                        }
+                    }
                 }
             }
         }
 
         // Vanity domain transfer is handled separately via the transfer-vanity command.
+    }
+
+    public function resolveTargetVanityDomain(string $sourceHost): ?string
+    {
+        if (preg_match('/^([a-z0-9-]+)\.laravel\.cloud$/', $sourceHost, $m)) {
+            $appName = $m[1];
+            try {
+                $targetApps = $this->target->getAll('applications');
+                foreach ($targetApps as $app) {
+                    if (($app['attributes']['slug'] ?? '') === $appName || ($app['attributes']['name'] ?? '') === $appName) {
+                        $envs = $this->target->getAll("applications/{$app['id']}/environments");
+                        foreach ($envs as $env) {
+                            $vd = $env['attributes']['vanity_domain'] ?? null;
+                            if ($vd) {
+                                return $vd;
+                            }
+                        }
+                    }
+                }
+            } catch (\RuntimeException) {
+                return null;
+            }
+        }
+
+        return null;
     }
 
     /**
