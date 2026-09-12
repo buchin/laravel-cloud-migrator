@@ -1254,21 +1254,37 @@ class MigrationService
 
             @unlink($schemaFile);
 
+            // Relax any STORED GENERATED columns in target schema before data load
+            $storedGenCols = $this->getStoredGeneratedColumns($importBin, $tgtConn, $tgtDb);
+            if (empty($storedGenCols)) {
+                $storedGenCols = $this->getStoredGeneratedColumns($importBin, $srcConn, $srcDb);
+            }
+            foreach ($storedGenCols as $colInfo) {
+                $progress("  Relaxing stored generated column: {$colInfo['table']}.{$colInfo['column']}...");
+                $this->relaxStoredGeneratedColumn($importBin, $tgtConn, $tgtDb, $colInfo);
+            }
+
             // ── Phase 2: parallel per-table data dumps ───────────────────────
-            $tables = $this->getSourceTables($srcConn, $srcDb, $ignoreTables);
+            $tables = $this->getSourceTables($srcConn, $srcDb, $ignoreTables, $concurrency);
             $total = count($tables);
 
             if ($ignoreTables) {
                 $progress('  Excluding tables: '.implode(', ', $ignoreTables));
             }
 
-            $progress("  Migrating {$total} table(s) with concurrency={$concurrency}...");
+            $progress("  Migrating {$total} item(s) with concurrency={$concurrency}...");
 
             $this->runParallelTableDumps(
                 $dumpBin, $importBin, $optFile,
                 $srcConn, $srcDb, $tgtConn, $tgtDb,
                 $tables, $tmpDir, $concurrency, $progress,
             );
+
+            // Restore any STORED GENERATED columns in target schema
+            foreach ($storedGenCols as $colInfo) {
+                $progress("  Restoring stored generated column: {$colInfo['table']}.{$colInfo['column']}...");
+                $this->restoreStoredGeneratedColumn($importBin, $tgtConn, $tgtDb, $colInfo);
+            }
 
             $progress("Data migrated: {$srcDb}");
 
@@ -1277,6 +1293,80 @@ class MigrationService
                 @unlink($file);
             }
             @rmdir($tmpDir);
+        }
+    }
+
+    /** Return any stored generated columns in target DB so they can be relaxed during data load. */
+    private function getStoredGeneratedColumns(string $mysqlBin, array $tgtConn, string $tgtDb): array
+    {
+        $sql = "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, GENERATION_EXPRESSION FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '".addslashes($tgtDb)."' AND EXTRA LIKE '%STORED GENERATED%'";
+        $cmd = escapeshellarg($mysqlBin)
+            .' --ssl-mode=DISABLED --batch --skip-column-names'
+            .' -h '.escapeshellarg($tgtConn['hostname'])
+            .' -P '.(int) $tgtConn['port']
+            .' -u '.escapeshellarg($tgtConn['username'])
+            .' --password='.escapeshellarg($tgtConn['password'])
+            .' -e '.escapeshellarg($sql)
+            .' '.escapeshellarg($tgtDb)
+            .' 2>/dev/null';
+
+        exec($cmd, $output, $exitCode);
+        if ($exitCode !== 0 || empty($output)) {
+            return [];
+        }
+
+        $cols = [];
+        foreach ($output as $line) {
+            $parts = explode("\t", trim($line));
+            if (count($parts) >= 4) {
+                $cleanExpr = str_replace(["\\\\'", "\\'"], "'", $parts[3]);
+                $cols[] = [
+                    'table' => $parts[0],
+                    'column' => $parts[1],
+                    'type' => $parts[2],
+                    'expression' => $cleanExpr,
+                ];
+            }
+        }
+
+        return $cols;
+    }
+
+    private function relaxStoredGeneratedColumn(string $mysqlBin, array $tgtConn, string $tgtDb, array $colInfo): void
+    {
+        $sql = "ALTER TABLE `{$colInfo['table']}` MODIFY COLUMN `{$colInfo['column']}` {$colInfo['type']} NULL";
+        $cmd = escapeshellarg($mysqlBin)
+            .' --ssl-mode=DISABLED'
+            .' --init-command='.escapeshellarg('SET SESSION wait_timeout=28800, net_read_timeout=3600, net_write_timeout=3600')
+            .' -h '.escapeshellarg($tgtConn['hostname'])
+            .' -P '.(int) $tgtConn['port']
+            .' -u '.escapeshellarg($tgtConn['username'])
+            .' --password='.escapeshellarg($tgtConn['password'])
+            .' -e '.escapeshellarg($sql)
+            .' '.escapeshellarg($tgtDb);
+
+        exec($cmd, $output, $exitCode);
+        if ($exitCode !== 0) {
+            throw new \RuntimeException("Failed to relax stored generated column {$colInfo['table']}.{$colInfo['column']}: ".implode("\n", $output));
+        }
+    }
+
+    private function restoreStoredGeneratedColumn(string $mysqlBin, array $tgtConn, string $tgtDb, array $colInfo): void
+    {
+        $sql = "ALTER TABLE `{$colInfo['table']}` MODIFY COLUMN `{$colInfo['column']}` {$colInfo['type']} GENERATED ALWAYS AS ({$colInfo['expression']}) STORED";
+        $cmd = escapeshellarg($mysqlBin)
+            .' --ssl-mode=DISABLED'
+            .' --init-command='.escapeshellarg('SET SESSION wait_timeout=28800, net_read_timeout=3600, net_write_timeout=3600')
+            .' -h '.escapeshellarg($tgtConn['hostname'])
+            .' -P '.(int) $tgtConn['port']
+            .' -u '.escapeshellarg($tgtConn['username'])
+            .' --password='.escapeshellarg($tgtConn['password'])
+            .' -e '.escapeshellarg($sql)
+            .' '.escapeshellarg($tgtDb);
+
+        exec($cmd, $output, $exitCode);
+        if ($exitCode !== 0) {
+            throw new \RuntimeException("Failed to restore stored generated column {$colInfo['table']}.{$colInfo['column']}: ".implode("\n", $output));
         }
     }
 
@@ -1300,8 +1390,8 @@ class MigrationService
         return $exitCode;
     }
 
-    /** Return tables in the given schema ordered largest-first, excluding $ignoreTables. */
-    private function getSourceTables(array $conn, string $dbName, array $ignoreTables = []): array
+    /** Return tables in the given schema ordered largest-first, excluding $ignoreTables. Chunk very large tables across workers. */
+    private function getSourceTables(array $conn, string $dbName, array $ignoreTables = [], int $concurrency = 4): array
     {
         $mysql = $this->findBinary('mysql');
         if (! $mysql) {
@@ -1314,7 +1404,7 @@ class MigrationService
             $ignoreClause = " AND TABLE_NAME NOT IN ({$quoted})";
         }
 
-        $sql = 'SELECT TABLE_NAME FROM information_schema.TABLES'
+        $sql = 'SELECT TABLE_NAME, DATA_LENGTH FROM information_schema.TABLES'
             ." WHERE TABLE_SCHEMA='".addslashes($dbName)."'"
             ." AND TABLE_TYPE='BASE TABLE'"
             .$ignoreClause
@@ -1337,7 +1427,63 @@ class MigrationService
             return [];
         }
 
-        return array_values(array_filter(array_map('trim', $output)));
+        $items = [];
+        foreach ($output as $line) {
+            $parts = preg_split('/\s+/', trim($line));
+            $table = $parts[0] ?? '';
+            $dataLength = (int) ($parts[1] ?? 0);
+
+            if (! $table) {
+                continue;
+            }
+
+            // For very large tables (> 500MB) with an integer primary key, chunk across workers
+            if ($dataLength > 500 * 1024 * 1024 && $concurrency > 1) {
+                $rangeSql = "SELECT MIN(id), MAX(id), COUNT(*) FROM `{$table}`";
+                $rangeCmd = escapeshellarg($mysql)
+                    .' --ssl-mode=DISABLED --connect-timeout=10 --batch --skip-column-names'
+                    .' -h '.escapeshellarg($conn['hostname'])
+                    .' -P '.(int) $conn['port']
+                    .' -u '.escapeshellarg($conn['username'])
+                    .' --password='.escapeshellarg($conn['password'])
+                    .' -e '.escapeshellarg($rangeSql)
+                    .' '.escapeshellarg($dbName)
+                    .' 2>/dev/null';
+
+                exec($rangeCmd, $rangeOut, $rangeRc);
+                if ($rangeRc === 0 && ! empty($rangeOut[0])) {
+                    $rParts = preg_split('/\s+/', trim($rangeOut[0]));
+                    $minId = isset($rParts[0]) && is_numeric($rParts[0]) ? (int) $rParts[0] : null;
+                    $maxId = isset($rParts[1]) && is_numeric($rParts[1]) ? (int) $rParts[1] : null;
+                    $count = isset($rParts[2]) && is_numeric($rParts[2]) ? (int) $rParts[2] : 0;
+
+                    if ($minId !== null && $maxId !== null && $maxId > $minId && $count > 10000) {
+                        $step = (int) ceil(($maxId - $minId + 1) / $concurrency);
+                        for ($c = 0; $c < $concurrency; $c++) {
+                            $startId = $minId + ($c * $step);
+                            $endId = ($c === $concurrency - 1) ? null : ($startId + $step);
+                            $where = ($endId === null) ? "id >= {$startId}" : "id >= {$startId} AND id < {$endId}";
+                            $label = "{$table} [part ".($c + 1)."/{$concurrency}]";
+                            $items[] = [
+                                'table' => $table,
+                                'where' => $where,
+                                'label' => $label,
+                            ];
+                        }
+
+                        continue;
+                    }
+                }
+            }
+
+            $items[] = [
+                'table' => $table,
+                'where' => null,
+                'label' => $table,
+            ];
+        }
+
+        return $items;
     }
 
     /**
@@ -1361,6 +1507,7 @@ class MigrationService
             .' --force'
             .' --max-allowed-packet=64M'
             .' --ssl-mode=DISABLED'
+            .' --compress'
             .' --compression-algorithms=zlib,uncompressed'
             .' --init-command='.escapeshellarg('SET SESSION foreign_key_checks=0, unique_checks=0, wait_timeout=28800, net_read_timeout=3600, net_write_timeout=3600')
             .' -h '.escapeshellarg($tgtConn['hostname'])
@@ -1370,7 +1517,7 @@ class MigrationService
             .' '.escapeshellarg($tgtDb);
 
         $pending = array_values($tables);
-        $running = [];  // table → ['phase', 'proc', 'sqlFile', 'dumpErrFile', 'importErrFile']
+        $running = [];  // label → ['phase', 'proc', 'sqlFile', 'dumpErrFile', 'importErrFile', 'label', 'table']
         $completed = 0;
         $total = count($tables);
         $failedTables = [];
@@ -1378,14 +1525,23 @@ class MigrationService
         while (! empty($pending) || ! empty($running)) {
             // Start new dump workers up to the concurrency cap.
             while (count($running) < $concurrency && ! empty($pending)) {
-                $table = array_shift($pending);
-                $safe = preg_replace('/[^a-zA-Z0-9_]/', '_', $table);
+                $item = array_shift($pending);
+                $table = is_array($item) ? $item['table'] : $item;
+                $where = is_array($item) ? $item['where'] : null;
+                $label = is_array($item) ? $item['label'] : $item;
+
+                $safe = preg_replace('/[^a-zA-Z0-9_]/', '_', $label);
                 $sqlFile = $tmpDir.'/'.$safe.'.sql';
                 $dumpErrFile = $tmpDir.'/'.$safe.'.dump.err';
+
+                $whereFlag = $where ? ' --where='.escapeshellarg($where) : '';
 
                 $dumpCmd = escapeshellarg($dumpBin)
                     .' --defaults-extra-file='.escapeshellarg($optFile)
                     .' --single-transaction'
+                    .' --quick'
+                    .' --compress'
+                    .' --skip-add-locks'
                     .' --no-tablespaces'
                     .' --no-create-info'   // schema already imported in phase 1
                     .' --set-gtid-purged=OFF'
@@ -1396,6 +1552,7 @@ class MigrationService
                     .' -P '.(int) $srcConn['port']
                     .' -u '.escapeshellarg($srcConn['username'])
                     .' --password='.escapeshellarg($srcConn['password'])
+                    .$whereFlag
                     .' '.escapeshellarg($srcDb)
                     .' '.escapeshellarg($table);
 
@@ -1406,22 +1563,24 @@ class MigrationService
                 ], $pipes);
 
                 if (is_resource($proc)) {
-                    $running[$table] = [
+                    $running[$label] = [
                         'phase' => 'dumping',
                         'proc' => $proc,
                         'sqlFile' => $sqlFile,
                         'dumpErrFile' => $dumpErrFile,
                         'importErrFile' => null,
+                        'label' => $label,
+                        'table' => $table,
                     ];
                 } else {
-                    $progress("  ✗ Could not start dump for {$table}");
-                    $failedTables[] = $table;
+                    $progress("  ✗ Could not start dump for {$label}");
+                    $failedTables[] = $label;
                 }
             }
 
             // Poll each running worker.
-            foreach (array_keys($running) as $table) {
-                $worker = $running[$table];
+            foreach (array_keys($running) as $label) {
+                $worker = $running[$label];
                 $status = proc_get_status($worker['proc']);
 
                 if ($status['running']) {
@@ -1433,15 +1592,17 @@ class MigrationService
                     $exitCode = $status['exitcode'] ?? -1;
                 }
 
+                $safe = preg_replace('/[^a-zA-Z0-9_]/', '_', $worker['label']);
+
                 if ($worker['phase'] === 'dumping') {
                     if ($exitCode !== 0) {
                         $err = trim(file_get_contents($worker['dumpErrFile']) ?: '');
-                        $progress("  ✗ Dump failed: {$table}".($err ? " — {$err}" : ''));
-                        $failedTables[] = $table;
-                        unset($running[$table]);
+                        $progress("  ✗ Dump failed: {$label}".($err ? " — {$err}" : ''));
+                        $failedTables[] = $label;
+                        unset($running[$label]);
                     } else {
                         // Transition: start import immediately.
-                        $importErrFile = $tmpDir.'/'.preg_replace('/[^a-zA-Z0-9_]/', '_', $table).'.import.err';
+                        $importErrFile = $tmpDir.'/'.$safe.'.import.err';
                         $importProc = proc_open($baseImportCmd, [
                             0 => ['file', $worker['sqlFile'], 'r'],
                             1 => ['file', '/dev/null', 'w'],
@@ -1449,27 +1610,29 @@ class MigrationService
                         ], $pipes);
 
                         if (is_resource($importProc)) {
-                            $running[$table] = [
+                            $running[$label] = [
                                 'phase' => 'importing',
                                 'proc' => $importProc,
                                 'sqlFile' => $worker['sqlFile'],
                                 'dumpErrFile' => $worker['dumpErrFile'],
                                 'importErrFile' => $importErrFile,
+                                'label' => $label,
+                                'table' => $worker['table'],
                             ];
                         } else {
-                            $progress("  ✗ Could not start import for {$table}");
-                            $failedTables[] = $table;
-                            unset($running[$table]);
+                            $progress("  ✗ Could not start import for {$label}");
+                            $failedTables[] = $label;
+                            unset($running[$label]);
                         }
                     }
                 } elseif ($worker['phase'] === 'importing') {
                     if ($exitCode !== 0) {
                         $err = trim(file_get_contents($worker['importErrFile']) ?: '');
-                        $progress("  ✗ Import failed: {$table}".($err ? " — {$err}" : ''));
-                        $failedTables[] = $table;
+                        $progress("  ✗ Import failed: {$label}".($err ? " — {$err}" : ''));
+                        $failedTables[] = $label;
                     } else {
                         $completed++;
-                        $progress("  ✓ {$table} ({$completed}/{$total})");
+                        $progress("  ✓ {$label} ({$completed}/{$total})");
 
                         // Surface errors mysql swallowed via --force.
                         $importErrors = array_filter(
@@ -1484,7 +1647,7 @@ class MigrationService
                         }
                     }
 
-                    unset($running[$table]);
+                    unset($running[$label]);
                     @unlink($worker['sqlFile']);  // free disk space as we go
                 }
             }

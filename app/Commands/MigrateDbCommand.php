@@ -18,6 +18,7 @@ class MigrateDbCommand extends Command
     protected $signature = 'db:migrate
                             {--source-token= : API token for the source organization}
                             {--target-token= : API token for the target organization}
+                            {--schema=* : Specific schema(s) to migrate, format: schema or cluster.schema (e.g. --schema=dracin_api.main)}
                             {--skip-data=* : Skip data migration for specific schemas (e.g. --skip-data=nerd)}
                             {--ignore-table=* : Exclude specific tables, format: schema.table (e.g. --ignore-table=dojo.nerd_daily_report_urls)}
                             {--concurrency=4 : Parallel table dump workers for MySQL (default: 4)}
@@ -65,6 +66,7 @@ class MigrateDbCommand extends Command
             return self::FAILURE;
         }
 
+        $filterSchemas = (array) $this->option('schema');
         $skipSchemas = (array) $this->option('skip-data');
         $ignoreTables = (array) $this->option('ignore-table');
 
@@ -74,11 +76,17 @@ class MigrateDbCommand extends Command
 
         foreach ($sourcePairs as $key => $srcInfo) {
             $schemaName = $srcInfo['schema_name'];
-            if (in_array($schemaName, $skipSchemas, true)) {
+            if (! empty($filterSchemas)) {
+                if (! in_array($key, $filterSchemas, true) && ! in_array($schemaName, $filterSchemas, true)) {
+                    continue;
+                }
+            }
+            if (in_array($key, $skipSchemas, true) || in_array($schemaName, $skipSchemas, true)) {
                 continue;
             }
             if (isset($targetConnMap[$key])) {
                 $pairs[] = [
+                    'key' => $key,
                     'schema' => $schemaName,
                     'src_conn' => $srcInfo['connection'],
                     'tgt_conn' => $targetConnMap[$key],
@@ -95,9 +103,9 @@ class MigrateDbCommand extends Command
         $this->newLine();
 
         foreach ($pairs as $pair) {
-            $schemaIgnoreTables = $this->resolveIgnoreTables($pair['schema'], $ignoreTables);
+            $schemaIgnoreTables = $this->resolveIgnoreTables($pair['schema'], $ignoreTables, $pair['key']);
             $ignoreNote = $schemaIgnoreTables ? ' <fg=gray>(excluding: '.implode(', ', $schemaIgnoreTables).')</>' : '';
-            $this->line("  <fg=green>✓</> <fg=cyan>{$pair['schema']}</>{$ignoreNote}");
+            $this->line("  <fg=green>✓</> <fg=cyan>{$pair['key']}</>{$ignoreNote}");
         }
 
         if (! empty($skipSchemas)) {
@@ -135,10 +143,10 @@ class MigrateDbCommand extends Command
 
         foreach ($pairs as $pair) {
             $schemaName = $pair['schema'];
-            $schemaIgnoreTables = $this->resolveIgnoreTables($schemaName, $ignoreTables);
+            $schemaIgnoreTables = $this->resolveIgnoreTables($schemaName, $ignoreTables, $pair['key']);
 
             $this->newLine();
-            $this->line("<fg=cyan;options=bold>── {$schemaName} ──</>");
+            $this->line("<fg=cyan;options=bold>── {$pair['key']} ──</>");
 
             $tgtConn = $pair['tgt_conn'];
             $tableCount = 0;
@@ -273,13 +281,15 @@ class MigrateDbCommand extends Command
     }
 
     /** Resolve which tables to ignore for a given schema from the --ignore-table list. */
-    private function resolveIgnoreTables(string $schema, array $ignoreTables): array
+    private function resolveIgnoreTables(string $schema, array $ignoreTables, ?string $key = null): array
     {
         $result = [];
+        $clusterName = $key && str_contains($key, '.') ? explode('.', $key)[0] : null;
+
         foreach ($ignoreTables as $entry) {
             if (str_contains($entry, '.')) {
                 [$s, $table] = explode('.', $entry, 2);
-                if ($s === $schema) {
+                if ($s === $schema || ($clusterName && $s === $clusterName)) {
                     $result[] = $table;
                 }
             } else {
