@@ -749,13 +749,38 @@ class MigrationService
         if (isset($this->clusterRegistry[$sourceClusterId])) {
             $newClusterId = $this->clusterRegistry[$sourceClusterId];
         } else {
+            $clusterPayload = [
+                'type' => $attrs['type'],
+                'name' => $attrs['name'],
+                'region' => $attrs['region'],
+                'config' => $attrs['config'] ?? [],
+            ];
+
+            if (isset($attrs['version'])) {
+                $clusterPayload['version'] = $attrs['version'];
+            } else {
+                try {
+                    $types = $this->target->get('databases/types');
+                    foreach ($types['data'] ?? [] as $t) {
+                        if (($t['type'] ?? '') === $attrs['type'] && ! empty($t['versions'])) {
+                            $clusterPayload['version'] = end($t['versions']);
+                            break;
+                        }
+                    }
+                } catch (\RuntimeException) {
+                }
+
+                if (! isset($clusterPayload['version'])) {
+                    if ($attrs['type'] === 'laravel_mysql' || $attrs['type'] === 'aws_rds_mysql') {
+                        $clusterPayload['version'] = '8.4';
+                    } elseif (str_contains($attrs['type'], 'postgres')) {
+                        $clusterPayload['version'] = '18';
+                    }
+                }
+            }
+
             try {
-                $newCluster = $this->target->post('databases/clusters', [
-                    'type' => $attrs['type'],
-                    'name' => $attrs['name'],
-                    'region' => $attrs['region'],
-                    'config' => $attrs['config'] ?? [],
-                ]);
+                $newCluster = $this->target->post('databases/clusters', $clusterPayload);
                 $newClusterId = $newCluster['data']['id'];
                 $this->lastCreatedClusterId = $newClusterId;
             } catch (\RuntimeException $e) {
