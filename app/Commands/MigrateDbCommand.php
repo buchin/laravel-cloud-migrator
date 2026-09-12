@@ -4,6 +4,7 @@ namespace App\Commands;
 
 use App\Services\CloudApiClient;
 use App\Services\MigrationService;
+use App\Services\TableChunker;
 use LaravelZero\Framework\Commands\Command;
 use RuntimeException;
 
@@ -22,6 +23,7 @@ class MigrateDbCommand extends Command
                             {--skip-data=* : Skip data migration for specific schemas (e.g. --skip-data=nerd)}
                             {--ignore-table=* : Exclude specific tables, format: schema.table (e.g. --ignore-table=dojo.nerd_daily_report_urls)}
                             {--concurrency=4 : Parallel table dump workers for MySQL (default: 4)}
+                            {--chunk-size=50000 : Chunk size in rows for dynamic auto-chunking (default: 50000)}
                             {--show-tables : Show per-table progress lines (default: schema-level summary only)}
                             {--yes : Skip confirmation prompt and proceed automatically}';
 
@@ -102,10 +104,29 @@ class MigrateDbCommand extends Command
         $this->line(str_repeat('─', 50));
         $this->newLine();
 
+        $chunkSize = max(1000, (int) ($this->option('chunk-size') ?: TableChunker::DEFAULT_CHUNK_SIZE));
+
         foreach ($pairs as $pair) {
             $schemaIgnoreTables = $this->resolveIgnoreTables($pair['schema'], $ignoreTables, $pair['key']);
             $ignoreNote = $schemaIgnoreTables ? ' <fg=gray>(excluding: '.implode(', ', $schemaIgnoreTables).')</>' : '';
             $this->line("  <fg=green>✓</> <fg=cyan>{$pair['key']}</>{$ignoreNote}");
+
+            // Detect large tables (>1 GB or >100k rows) in MySQL schemas
+            if (! str_contains($pair['db_type'], 'pgsql') && ! str_contains($pair['db_type'], 'postgres')) {
+                $largeTables = $this->detectLargeTables($pair['src_conn'], $pair['schema'], $schemaIgnoreTables);
+                if (! empty($largeTables)) {
+                    $largeCount = count($largeTables);
+                    $this->line("    <fg=yellow>⚡</> Auto-chunking active: {$largeCount} table(s) exceed >1 GB or >100k rows:");
+                    foreach ($largeTables as $table => $metrics) {
+                        $sizeFormatted = $this->formatBytes($metrics['total_bytes']);
+                        $rowsFormatted = number_format($metrics['row_count']);
+                        $strategy = $metrics['strategy'] === 'pk_range'
+                            ? "PK range (`{$metrics['pk_column']}`)"
+                            : 'limit-offset';
+                        $this->line("       • <fg=cyan>{$table}</> ({$sizeFormatted}, {$rowsFormatted} rows) → {$strategy}");
+                    }
+                }
+            }
         }
 
         if (! empty($skipSchemas)) {
@@ -159,11 +180,11 @@ class MigrateDbCommand extends Command
                     tgtDb: $schemaName,
                     dbType: $pair['db_type'],
                     progress: function (string $message) use ($verbose, &$tableCount) {
-                        // Per-table lines look like "  Migrated tablename (N rows)"
-                        $isTableLine = str_starts_with(ltrim($message), 'Migrated ') && str_contains($message, ' rows)');
+                        // Per-table lines look like "  Migrated tablename (N rows)" or "  ✓ tablename [part 1/9]"
+                        $isTableLine = str_starts_with(ltrim($message), 'Migrated ') || str_contains($message, '[part ');
                         if ($isTableLine) {
                             $tableCount++;
-                            if ($verbose) {
+                            if ($verbose || str_contains($message, '[part ')) {
                                 $this->line("  <fg=green>✓</> {$message}");
                             }
                         } else {
@@ -172,6 +193,7 @@ class MigrateDbCommand extends Command
                     },
                     ignoreTables: $schemaIgnoreTables,
                     concurrency: $concurrency,
+                    chunkSize: $chunkSize,
                 );
 
                 if (! $verbose && $tableCount > 0) {
@@ -298,5 +320,71 @@ class MigrateDbCommand extends Command
         }
 
         return $result;
+    }
+
+    public function getTableChunker(): TableChunker
+    {
+        return new TableChunker;
+    }
+
+    public function detectLargeTables(
+        array $conn,
+        string $schemaName,
+        array $ignoreTables = [],
+        ?TableChunker $chunker = null
+    ): array {
+        $chunker = $chunker ?? $this->getTableChunker();
+        $mysql = $this->findBinary('mysql');
+        if (! $mysql) {
+            return [];
+        }
+
+        try {
+            $inspected = $chunker->inspectTables($mysql, $conn, $schemaName, $ignoreTables);
+
+            return array_filter($inspected, fn (array $tableInfo) => $tableInfo['should_chunk']);
+        } catch (\Throwable) {
+            return [];
+        }
+    }
+
+    public function formatBytes(int $bytes): string
+    {
+        if ($bytes >= 1073741824) {
+            return round($bytes / 1073741824, 2).' GB';
+        }
+        if ($bytes >= 1048576) {
+            return round($bytes / 1048576, 2).' MB';
+        }
+        if ($bytes >= 1024) {
+            return round($bytes / 1024, 2).' KB';
+        }
+
+        return $bytes.' B';
+    }
+
+    private function findBinary(string $name): ?string
+    {
+        exec('which '.escapeshellarg($name).' 2>/dev/null', $out, $rc);
+        if ($rc === 0 && ! empty($out[0])) {
+            return trim($out[0]);
+        }
+
+        $knownPaths = [
+            '/opt/homebrew/opt/mysql-client/bin',
+            '/opt/homebrew/opt/mysql-client@8.0/bin',
+            '/usr/local/opt/mysql-client/bin',
+            '/usr/local/bin',
+            '/usr/bin',
+        ];
+
+        foreach ($knownPaths as $dir) {
+            $path = $dir.'/'.$name;
+            if (is_executable($path)) {
+                return $path;
+            }
+        }
+
+        return null;
     }
 }

@@ -62,10 +62,144 @@ class MigrationService
         return $this->binaryPaths[$name] = null;
     }
 
+    private TableChunker $tableChunker;
+
     public function __construct(
         private readonly CloudApiClient $source,
         private readonly CloudApiClient $target,
-    ) {}
+        ?TableChunker $tableChunker = null,
+    ) {
+        $this->tableChunker = $tableChunker ?? new TableChunker;
+    }
+
+    public function getTableChunker(): TableChunker
+    {
+        return $this->tableChunker;
+    }
+
+    public function setTableChunker(TableChunker $tableChunker): void
+    {
+        $this->tableChunker = $tableChunker;
+    }
+
+    public function getAntiDeadlockSqlPrefix(): string
+    {
+        return "SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0;\n"
+            ."SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0;\n";
+    }
+
+    public function getAntiDeadlockSqlSuffix(): string
+    {
+        return "\nSET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS;\n"
+            ."SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS;\n";
+    }
+
+    public function buildMysqldumpArgs(
+        array $conn,
+        string $db,
+        ?string $table = null,
+        ?string $where = null,
+        bool $schemaOnly = false,
+        ?string $optFile = null
+    ): array {
+        $args = [];
+        if ($optFile) {
+            $args[] = '--defaults-extra-file='.$optFile;
+        }
+
+        // Permanent anti-deadlock & streaming flags
+        $args[] = '--single-transaction';
+        $args[] = '--quick';
+        $args[] = '--compress';
+        $args[] = '--skip-add-locks';
+        $args[] = '--no-tablespaces';
+        $args[] = '--set-gtid-purged=OFF';
+        $args[] = '--max-allowed-packet=64M';
+        $args[] = '--ssl-mode=DISABLED';
+        $args[] = '--compression-algorithms=zlib,uncompressed';
+
+        if ($schemaOnly) {
+            $args[] = '--no-data';
+            $args[] = '--add-drop-table';
+        } else {
+            $args[] = '--no-create-info';
+        }
+
+        $args[] = '-h';
+        $args[] = $conn['hostname'];
+        $args[] = '-P';
+        $args[] = (string) (int) $conn['port'];
+        $args[] = '-u';
+        $args[] = $conn['username'];
+        $args[] = '--password='.$conn['password'];
+
+        if ($where !== null && $where !== '') {
+            $args[] = '--where='.$where;
+        }
+
+        $args[] = $db;
+
+        if ($table !== null && $table !== '') {
+            $args[] = $table;
+        }
+
+        return $args;
+    }
+
+    public function buildMysqlRestoreArgs(
+        array $conn,
+        string $db,
+        bool $force = true
+    ): array {
+        $args = [];
+        if ($force) {
+            $args[] = '--force';
+        }
+
+        $args[] = '--max-allowed-packet=64M';
+        $args[] = '--ssl-mode=DISABLED';
+        $args[] = '--compress';
+        $args[] = '--compression-algorithms=zlib,uncompressed';
+        $args[] = '--init-command=SET SESSION foreign_key_checks=0, unique_checks=0, wait_timeout=28800, net_read_timeout=3600, net_write_timeout=3600';
+
+        $args[] = '-h';
+        $args[] = $conn['hostname'];
+        $args[] = '-P';
+        $args[] = (string) (int) $conn['port'];
+        $args[] = '-u';
+        $args[] = $conn['username'];
+        $args[] = '--password='.$conn['password'];
+        $args[] = $db;
+
+        return $args;
+    }
+
+    public function buildMysqldumpCommand(
+        string $dumpBin,
+        array $conn,
+        string $db,
+        ?string $table = null,
+        ?string $where = null,
+        bool $schemaOnly = false,
+        ?string $optFile = null
+    ): string {
+        $args = $this->buildMysqldumpArgs($conn, $db, $table, $where, $schemaOnly, $optFile);
+        $escaped = array_map(escapeshellarg(...), $args);
+
+        return escapeshellarg($dumpBin).' '.implode(' ', $escaped);
+    }
+
+    public function buildMysqlRestoreCommand(
+        string $importBin,
+        array $conn,
+        string $db,
+        bool $force = true
+    ): string {
+        $args = $this->buildMysqlRestoreArgs($conn, $db, $force);
+        $escaped = array_map(escapeshellarg(...), $args);
+
+        return escapeshellarg($importBin).' '.implode(' ', $escaped);
+    }
 
     public function getLastCreatedAppId(): ?string
     {
@@ -946,7 +1080,7 @@ class MigrationService
         return null;
     }
 
-    public function runDatabaseMigration(array $srcConn, string $srcDb, array $tgtConn, string $tgtDb, string $dbType, callable $progress, array $ignoreTables = [], int $concurrency = 4): void
+    public function runDatabaseMigration(array $srcConn, string $srcDb, array $tgtConn, string $tgtDb, string $dbType, callable $progress, array $ignoreTables = [], int $concurrency = 4, int $chunkSize = TableChunker::DEFAULT_CHUNK_SIZE): void
     {
         $isPostgres = str_contains($dbType, 'pgsql') || str_contains($dbType, 'postgres');
 
@@ -965,7 +1099,7 @@ class MigrationService
                 throw new \RuntimeException('mysqldump/mysql not found — install MySQL client tools and retry.');
             }
 
-            $this->runMysqlMigration($dumpBin, $importBin, $srcConn, $srcDb, $tgtConn, $tgtDb, $progress, $ignoreTables, $concurrency);
+            $this->runMysqlMigration($dumpBin, $importBin, $srcConn, $srcDb, $tgtConn, $tgtDb, $progress, $ignoreTables, $concurrency, $chunkSize);
         }
     }
 
@@ -1238,6 +1372,7 @@ class MigrationService
         callable $progress,
         array $ignoreTables = [],
         int $concurrency = 4,
+        int $chunkSize = TableChunker::DEFAULT_CHUNK_SIZE,
     ): void {
         $tmpDir = sys_get_temp_dir().'/cloud_migrator_'.uniqid();
         mkdir($tmpDir, 0700, true);
@@ -1253,19 +1388,13 @@ class MigrationService
             $schemaFile = $tmpDir.'/schema.sql';
             $schemaErrFile = $tmpDir.'/schema.err';
 
-            $schemaDumpCmd = escapeshellarg($dumpBin)
-                .' --defaults-extra-file='.escapeshellarg($optFile)
-                .' --no-data'
-                .' --add-drop-table'
-                .' --no-tablespaces'
-                .' --set-gtid-purged=OFF'
-                .' --ssl-mode=DISABLED'
-                .' --compression-algorithms=zlib,uncompressed'
-                .' -h '.escapeshellarg($srcConn['hostname'])
-                .' -P '.(int) $srcConn['port']
-                .' -u '.escapeshellarg($srcConn['username'])
-                .' --password='.escapeshellarg($srcConn['password'])
-                .' '.escapeshellarg($srcDb);
+            $schemaDumpCmd = $this->buildMysqldumpCommand(
+                $dumpBin,
+                $srcConn,
+                $srcDb,
+                schemaOnly: true,
+                optFile: $optFile
+            );
 
             $proc = proc_open($schemaDumpCmd, [
                 0 => ['file', '/dev/null', 'r'],
@@ -1281,16 +1410,19 @@ class MigrationService
                 throw new \RuntimeException('Schema dump failed: '.trim(file_get_contents($schemaErrFile) ?: ''));
             }
 
-            $schemaImportCmd = escapeshellarg($importBin)
-                .' --ssl-mode=DISABLED'
-                .' --max-allowed-packet=64M'
-                .' --compression-algorithms=zlib,uncompressed'
-                .' --init-command='.escapeshellarg('SET SESSION foreign_key_checks=0')
-                .' -h '.escapeshellarg($tgtConn['hostname'])
-                .' -P '.(int) $tgtConn['port']
-                .' -u '.escapeshellarg($tgtConn['username'])
-                .' --password='.escapeshellarg($tgtConn['password'])
-                .' '.escapeshellarg($tgtDb);
+            // Wrap schema with permanent anti-deadlock and constraint disable guards
+            $schemaSql = file_get_contents($schemaFile) ?: '';
+            file_put_contents(
+                $schemaFile,
+                $this->getAntiDeadlockSqlPrefix().$schemaSql.$this->getAntiDeadlockSqlSuffix()
+            );
+
+            $schemaImportCmd = $this->buildMysqlRestoreCommand(
+                $importBin,
+                $tgtConn,
+                $tgtDb,
+                force: false
+            );
 
             $schemaImportErrFile = $tmpDir.'/schema.import.err';
             $proc = proc_open($schemaImportCmd, [
@@ -1320,7 +1452,7 @@ class MigrationService
             }
 
             // ── Phase 2: parallel per-table data dumps ───────────────────────
-            $tables = $this->getSourceTables($srcConn, $srcDb, $ignoreTables, $concurrency);
+            $tables = $this->getSourceTables($srcConn, $srcDb, $ignoreTables, $concurrency, $chunkSize);
             $total = count($tables);
 
             if ($ignoreTables) {
@@ -1445,100 +1577,32 @@ class MigrationService
         return $exitCode;
     }
 
-    /** Return tables in the given schema ordered largest-first, excluding $ignoreTables. Chunk very large tables across workers. */
-    private function getSourceTables(array $conn, string $dbName, array $ignoreTables = [], int $concurrency = 4): array
-    {
+    /**
+     * Return table partitions (chunked and unchunked) in the given schema ordered largest-first,
+     * dynamically auto-chunking tables exceeding 1 GB or 100,000 rows.
+     *
+     * @return array<int, array{table: string, where: string|null, label: string, chunked: bool, strategy: string, part: int, total_parts: int}>
+     */
+    public function getSourceTables(
+        array $conn,
+        string $dbName,
+        array $ignoreTables = [],
+        int $concurrency = 4,
+        int $chunkSize = TableChunker::DEFAULT_CHUNK_SIZE
+    ): array {
         $mysql = $this->findBinary('mysql');
         if (! $mysql) {
             return [];
         }
 
-        $ignoreClause = '';
-        if ($ignoreTables) {
-            $quoted = implode(',', array_map(fn ($t) => "'".addslashes($t)."'", $ignoreTables));
-            $ignoreClause = " AND TABLE_NAME NOT IN ({$quoted})";
-        }
-
-        $sql = 'SELECT TABLE_NAME, DATA_LENGTH FROM information_schema.TABLES'
-            ." WHERE TABLE_SCHEMA='".addslashes($dbName)."'"
-            ." AND TABLE_TYPE='BASE TABLE'"
-            .$ignoreClause
-            .' ORDER BY DATA_LENGTH DESC, TABLE_NAME';
-
-        $cmd = escapeshellarg($mysql)
-            .' --ssl-mode=DISABLED'
-            .' --connect-timeout=10'
-            .' --batch --skip-column-names'
-            .' -h '.escapeshellarg($conn['hostname'])
-            .' -P '.(int) $conn['port']
-            .' -u '.escapeshellarg($conn['username'])
-            .' --password='.escapeshellarg($conn['password'])
-            .' -e '.escapeshellarg($sql)
-            .' 2>/dev/null';
-
-        exec($cmd, $output, $exitCode);
-
-        if ($exitCode !== 0) {
-            return [];
-        }
-
-        $items = [];
-        foreach ($output as $line) {
-            $parts = preg_split('/\s+/', trim($line));
-            $table = $parts[0] ?? '';
-            $dataLength = (int) ($parts[1] ?? 0);
-
-            if (! $table) {
-                continue;
-            }
-
-            // For very large tables (> 500MB) with an integer primary key, chunk across workers
-            if ($dataLength > 500 * 1024 * 1024 && $concurrency > 1) {
-                $rangeSql = "SELECT MIN(id), MAX(id), COUNT(*) FROM `{$table}`";
-                $rangeCmd = escapeshellarg($mysql)
-                    .' --ssl-mode=DISABLED --connect-timeout=10 --batch --skip-column-names'
-                    .' -h '.escapeshellarg($conn['hostname'])
-                    .' -P '.(int) $conn['port']
-                    .' -u '.escapeshellarg($conn['username'])
-                    .' --password='.escapeshellarg($conn['password'])
-                    .' -e '.escapeshellarg($rangeSql)
-                    .' '.escapeshellarg($dbName)
-                    .' 2>/dev/null';
-
-                exec($rangeCmd, $rangeOut, $rangeRc);
-                if ($rangeRc === 0 && ! empty($rangeOut[0])) {
-                    $rParts = preg_split('/\s+/', trim($rangeOut[0]));
-                    $minId = isset($rParts[0]) && is_numeric($rParts[0]) ? (int) $rParts[0] : null;
-                    $maxId = isset($rParts[1]) && is_numeric($rParts[1]) ? (int) $rParts[1] : null;
-                    $count = isset($rParts[2]) && is_numeric($rParts[2]) ? (int) $rParts[2] : 0;
-
-                    if ($minId !== null && $maxId !== null && $maxId > $minId && $count > 10000) {
-                        $step = (int) ceil(($maxId - $minId + 1) / $concurrency);
-                        for ($c = 0; $c < $concurrency; $c++) {
-                            $startId = $minId + ($c * $step);
-                            $endId = ($c === $concurrency - 1) ? null : ($startId + $step);
-                            $where = ($endId === null) ? "id >= {$startId}" : "id >= {$startId} AND id < {$endId}";
-                            $label = "{$table} [part ".($c + 1)."/{$concurrency}]";
-                            $items[] = [
-                                'table' => $table,
-                                'where' => $where,
-                                'label' => $label,
-                            ];
-                        }
-
-                        continue;
-                    }
-                }
-            }
-
-            $items[] = [
-                'table' => $table,
-                'where' => null,
-                'label' => $table,
-            ];
-        }
-
-        return $items;
+        return $this->tableChunker->getTablePartitions(
+            $mysql,
+            $conn,
+            $dbName,
+            $ignoreTables,
+            $concurrency,
+            $chunkSize
+        );
     }
 
     /**
@@ -1558,21 +1622,10 @@ class MigrationService
         int $concurrency,
         callable $progress,
     ): void {
-        $baseImportCmd = escapeshellarg($importBin)
-            .' --force'
-            .' --max-allowed-packet=64M'
-            .' --ssl-mode=DISABLED'
-            .' --compress'
-            .' --compression-algorithms=zlib,uncompressed'
-            .' --init-command='.escapeshellarg('SET SESSION foreign_key_checks=0, unique_checks=0, wait_timeout=28800, net_read_timeout=3600, net_write_timeout=3600')
-            .' -h '.escapeshellarg($tgtConn['hostname'])
-            .' -P '.(int) $tgtConn['port']
-            .' -u '.escapeshellarg($tgtConn['username'])
-            .' --password='.escapeshellarg($tgtConn['password'])
-            .' '.escapeshellarg($tgtDb);
+        $baseImportCmd = $this->buildMysqlRestoreCommand($importBin, $tgtConn, $tgtDb, force: true);
 
         $pending = array_values($tables);
-        $running = [];  // label → ['phase', 'proc', 'sqlFile', 'dumpErrFile', 'importErrFile', 'label', 'table']
+        $running = [];  // label → ['phase', 'proc', 'sqlFile', 'dumpErrFile', 'importErrFile', 'label', 'table', 'attempt']
         $completed = 0;
         $total = count($tables);
         $failedTables = [];
@@ -1589,27 +1642,15 @@ class MigrationService
                 $sqlFile = $tmpDir.'/'.$safe.'.sql';
                 $dumpErrFile = $tmpDir.'/'.$safe.'.dump.err';
 
-                $whereFlag = $where ? ' --where='.escapeshellarg($where) : '';
-
-                $dumpCmd = escapeshellarg($dumpBin)
-                    .' --defaults-extra-file='.escapeshellarg($optFile)
-                    .' --single-transaction'
-                    .' --quick'
-                    .' --compress'
-                    .' --skip-add-locks'
-                    .' --no-tablespaces'
-                    .' --no-create-info'   // schema already imported in phase 1
-                    .' --set-gtid-purged=OFF'
-                    .' --max-allowed-packet=64M'
-                    .' --ssl-mode=DISABLED'
-                    .' --compression-algorithms=zlib,uncompressed'
-                    .' -h '.escapeshellarg($srcConn['hostname'])
-                    .' -P '.(int) $srcConn['port']
-                    .' -u '.escapeshellarg($srcConn['username'])
-                    .' --password='.escapeshellarg($srcConn['password'])
-                    .$whereFlag
-                    .' '.escapeshellarg($srcDb)
-                    .' '.escapeshellarg($table);
+                $dumpCmd = $this->buildMysqldumpCommand(
+                    $dumpBin,
+                    $srcConn,
+                    $srcDb,
+                    table: $table,
+                    where: $where,
+                    schemaOnly: false,
+                    optFile: $optFile
+                );
 
                 $proc = proc_open($dumpCmd, [
                     0 => ['file', '/dev/null', 'r'],
@@ -1626,6 +1667,7 @@ class MigrationService
                         'importErrFile' => null,
                         'label' => $label,
                         'table' => $table,
+                        'attempt' => 1,
                     ];
                 } else {
                     $progress("  ✗ Could not start dump for {$label}");
@@ -1673,6 +1715,7 @@ class MigrationService
                                 'importErrFile' => $importErrFile,
                                 'label' => $label,
                                 'table' => $worker['table'],
+                                'attempt' => 1,
                             ];
                         } else {
                             $progress("  ✗ Could not start import for {$label}");
@@ -1683,6 +1726,29 @@ class MigrationService
                 } elseif ($worker['phase'] === 'importing') {
                     if ($exitCode !== 0) {
                         $err = trim(file_get_contents($worker['importErrFile']) ?: '');
+                        $isDeadlock = str_contains($err, '1213')
+                            || stripos($err, 'Deadlock found') !== false
+                            || str_contains($err, '1205')
+                            || stripos($err, 'Lock wait timeout') !== false;
+
+                        $attempt = $worker['attempt'] ?? 1;
+                        if ($isDeadlock && $attempt < 3) {
+                            $progress("  ⚠ Deadlock/lock timeout on {$label} (attempt {$attempt}/3) — retrying in ".($attempt * 2).'s...');
+                            sleep($attempt * 2);
+                            $importProc = proc_open($baseImportCmd, [
+                                0 => ['file', $worker['sqlFile'], 'r'],
+                                1 => ['file', '/dev/null', 'w'],
+                                2 => ['file', $worker['importErrFile'], 'w'],
+                            ], $pipes);
+
+                            if (is_resource($importProc)) {
+                                $running[$label]['proc'] = $importProc;
+                                $running[$label]['attempt'] = $attempt + 1;
+
+                                continue;
+                            }
+                        }
+
                         $progress("  ✗ Import failed: {$label}".($err ? " — {$err}" : ''));
                         $failedTables[] = $label;
                     } else {
