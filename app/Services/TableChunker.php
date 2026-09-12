@@ -202,6 +202,106 @@ class TableChunker
     }
 
     /**
+     * Detect primary key column and whether it is integer-based using a PDO connection.
+     *
+     * @return array{column: string, is_integer: bool, type: string}|null
+     */
+    public function detectPrimaryKeyViaPdo(\PDO $pdo, string $table, ?string $dbName = null): ?array
+    {
+        $driver = $pdo->getAttribute(\PDO::ATTR_DRIVER_NAME);
+
+        if ($driver === 'sqlite') {
+            $stmt = $pdo->query("PRAGMA table_info(`{$table}`)");
+            $cols = $stmt ? $stmt->fetchAll(\PDO::FETCH_ASSOC) : [];
+            $priCols = array_values(array_filter($cols, fn ($c) => ! empty($c['pk'])));
+
+            if (count($priCols) !== 1) {
+                return null;
+            }
+
+            $column = $priCols[0]['name'] ?? '';
+            $type = strtolower($priCols[0]['type'] ?? '');
+            $intTypes = ['int', 'integer', 'bigint', 'mediumint', 'smallint', 'tinyint'];
+            $isInteger = in_array($type, $intTypes, true) || str_contains($type, 'int');
+
+            return [
+                'column' => $column,
+                'is_integer' => $isInteger,
+                'type' => $type,
+            ];
+        }
+
+        if ($driver === 'mysql') {
+            $dbClause = $dbName ? "TABLE_SCHEMA = '".addslashes($dbName)."' AND " : '';
+            $sql = 'SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS '
+                ."WHERE {$dbClause}TABLE_NAME = '".addslashes($table)."' "
+                ."AND COLUMN_KEY = 'PRI' ORDER BY ORDINAL_POSITION";
+
+            $stmt = $pdo->query($sql);
+            $rows = $stmt ? $stmt->fetchAll(\PDO::FETCH_ASSOC) : [];
+
+            if (count($rows) !== 1) {
+                return null;
+            }
+
+            $column = $rows[0]['COLUMN_NAME'] ?? '';
+            $type = strtolower($rows[0]['DATA_TYPE'] ?? '');
+            $intTypes = ['int', 'integer', 'bigint', 'mediumint', 'smallint', 'tinyint'];
+            $isInteger = in_array($type, $intTypes, true);
+
+            return [
+                'column' => $column,
+                'is_integer' => $isInteger,
+                'type' => $type,
+            ];
+        }
+
+        // Generic fallback for PostgreSQL / mocks
+        try {
+            $sql = 'SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS '
+                ."WHERE TABLE_NAME = '".addslashes($table)."' AND COLUMN_KEY = 'PRI'";
+            $stmt = $pdo->query($sql);
+            $rows = $stmt ? $stmt->fetchAll(\PDO::FETCH_ASSOC) : [];
+
+            if (count($rows) === 1) {
+                $column = $rows[0]['COLUMN_NAME'] ?? '';
+                $type = strtolower($rows[0]['DATA_TYPE'] ?? '');
+                $intTypes = ['int', 'integer', 'bigint', 'mediumint', 'smallint', 'tinyint'];
+
+                return [
+                    'column' => $column,
+                    'is_integer' => in_array($type, $intTypes, true),
+                    'type' => $type,
+                ];
+            }
+        } catch (\Throwable) {
+        }
+
+        return null;
+    }
+
+    /**
+     * Get table primary key range and row count via PDO.
+     *
+     * @return array{min_id: ?int, max_id: ?int, total_rows: int}
+     */
+    public function getTableRangeViaPdo(\PDO $pdo, string $table, string $pkColumn): array
+    {
+        $stmt = $pdo->query("SELECT MIN(`{$pkColumn}`), MAX(`{$pkColumn}`), COUNT(*) FROM `{$table}`");
+        $row = $stmt ? $stmt->fetch(\PDO::FETCH_NUM) : null;
+
+        $minId = isset($row[0]) && is_numeric($row[0]) ? (int) $row[0] : null;
+        $maxId = isset($row[1]) && is_numeric($row[1]) ? (int) $row[1] : null;
+        $count = isset($row[2]) && is_numeric($row[2]) ? (int) $row[2] : 0;
+
+        return [
+            'min_id' => $minId,
+            'max_id' => $maxId,
+            'total_rows' => $count,
+        ];
+    }
+
+    /**
      * Inspect all tables in a schema and return size, row count, and chunking recommendations.
      *
      * @return array<string, array{table: string, data_length: int, index_length: int, total_bytes: int, row_count: int, should_chunk: bool, strategy: string, pk_column: ?string}>
